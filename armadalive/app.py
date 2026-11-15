@@ -1,4 +1,4 @@
-import json, os, signal, sys
+import json, os, signal, socket, sys
 from PySide6.QtCore import QObject, QPoint, QTimer, QUrl, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
@@ -26,7 +26,7 @@ from .controls import Controls
 from .gamescope import Gamescope
 from .health import Health
 from .nowplaying import NowPlaying
-from .settings import Settings
+from .settings import CONFIRM_S, Settings
 from .shell import Shell
 from .steamshortcuts import SteamShortcuts
 from .steamui import SteamUi
@@ -60,7 +60,21 @@ def install_signal_handlers(app, ayn):
     wake.start(250)
 
 
+def _notify_ready(app, address):
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notification:
+            notification.setblocking(False)
+            notification.sendto(b"READY=1", address)
+    except OSError as error:
+        print(f"ArmadaLive: could not send startup notification: {error}", file=sys.stderr)
+        app.exit(1)
+
+
 def main():
+    # Reserve the service manager's notification address for this process.
+    notify_address = os.environ.pop("NOTIFY_SOCKET", None)
     recover_restore(startup=True)  # Finish recovery before any backend reads or writes configuration.
     app = QGuiApplication(sys.argv)
     app.setApplicationName("ArmadaLive")
@@ -94,9 +108,10 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     install_signal_handlers(app, backends["ayn"])
     engine.load(QUrl.fromLocalFile(HERE + "/qml/Main.qml"))
-    if not engine.rootObjects():
+    roots = engine.rootObjects()
+    if not roots or not isinstance(roots[0], QQuickWindow):
         return 1
-    window = engine.rootObjects()[0]
+    window = roots[0]
     presentation = (monitor, gamescope, backends["admin"], backends["controls"], backends["health"], backends["media"])
 
     def update_presentation():
@@ -138,9 +153,7 @@ def main():
             ms, later = sys.argv[sys.argv.index("--demo-later") + 1].split(":", 1)
             QTimer.singleShot(int(ms), lambda: backends["nowPlaying"].pin(json.loads(later).get("event"), json.loads(later).get("ui")))
         if "--keep-demo" in sys.argv:  # show the keep-or-undo bar with 11 s left (nothing is changed or reverted)
-            st = backends["settings"]
-            st._undo, st._left = {("profile", "demo", "demo"): "x"}, 11
-            st.changed.emit()
+            window.setProperty("tuningDemo", dict(active=True, seconds=11, total=CONFIRM_S, busy=False, recovery=False))
         if "--ask" in sys.argv:
             window.setProperty("askDemo", sys.argv[sys.argv.index("--ask") + 1])
         if "--notice" in sys.argv:  # code:title, show that popup message 600 ms in
@@ -162,4 +175,7 @@ def main():
             QTimer.singleShot(int(sys.argv[sys.argv.index("--close-demo") + 1]), lambda: backends["pad"].feed("demo", press))
         delay = int(sys.argv[sys.argv.index("--delay") + 1]) if "--delay" in sys.argv else 3000
         QTimer.singleShot(delay, lambda: (print("dimmed:", window.property("dimmed")), QQuickWindow.grabWindow(window).save(out), app.quit()))
+    elif notify_address:
+        # Confirm startup from inside the event loop.
+        QTimer.singleShot(0, lambda: _notify_ready(app, notify_address))
     return app.exec()
