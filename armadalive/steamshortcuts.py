@@ -1,6 +1,7 @@
 """Prepare ES-DE launch commands and artwork for Steam shortcuts."""
 import base64, glob, json, logging, os, re, shlex, struct, threading, time
 from typing import Callable, NamedTuple
+from math import ceil
 from PySide6.QtCore import Property, QBuffer, QIODevice, QObject, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QImage
 
@@ -156,6 +157,13 @@ class _Request(NamedTuple):
     title: str
     is_current: Callable[[], bool]
     deadline: float
+    esde_game: tuple[str, str] | None = None
+
+
+class _RuleWait(NamedTuple):
+    request: _Request
+    dispatch: Callable[[], None]
+    deadline: float
 
 
 class SteamShortcuts(QObject):
@@ -168,9 +176,11 @@ class SteamShortcuts(QObject):
     notice = Signal(str, str)   # completion code and the game title
     _prepared = Signal(object, object)
 
-    def __init__(self, nowplaying=None, parent=None):
+    def __init__(self, nowplaying=None, parent=None, *, prepare_esde_launch=None):
         super().__init__(parent)
         self._np = nowplaying
+        self._prepare_esde_launch = prepare_esde_launch
+        self._waiting_rule = None
         self._s = dict(possible=False, exists=False)
         self._request = self._preparing = None
         self._log = ("", 0, 0)
@@ -246,7 +256,8 @@ class SteamShortcuts(QObject):
     def _start(self, action, title, system, path, resolve, current):
         if self.state["busy"]:
             return
-        request = _Request(action, title, current, time.monotonic() + PREPARE_TIMEOUT_MS / 1000)
+        request = _Request(action, title, current, time.monotonic() + PREPARE_TIMEOUT_MS / 1000,
+                           (system, path) if action == "launch" else None)
         self._request = self._preparing = request
         recent = self._recent
         self.changed.emit()
@@ -267,6 +278,8 @@ class SteamShortcuts(QObject):
         if self._preparing is not None:
             # Leave the slot occupied until the filesystem call returns.
             self._finish(self._preparing, "prepareFailed")
+        elif self._waiting_rule is not None:
+            self._finish(self._waiting_rule.request, "prepareFailed")
 
     @Slot(object, object)
     def _accept_preparation(self, request, result):
@@ -287,17 +300,69 @@ class SteamShortcuts(QObject):
             self._evaluate(request, result.script, lambda value: self._added(request, result.options, value),
                            request.deadline)
 
-    def _evaluate(self, request, script, done, deadline):
-        # Check before discovery and again immediately before the socket sends.
-        # Deliver confirmed results even after invalidation so _added can cache an
-        # already-created shortcut; _finish suppresses obsolete notices.
-        def valid():
-            return self._can_dispatch(request) and time.monotonic() < deadline
+    def _rule_result(self, request):
+        if self._prepare_esde_launch is None or request.esde_game is None:
+            return ""
+        try:
+            return self._prepare_esde_launch(*request.esde_game, request.title)
+        except Exception:
+            log.exception("Could not prepare emulator rules")
+            return "Could not prepare game rules"
 
-        if valid():
-            eval_js(script, done, valid=valid)
+    def _wait_for_rule(self, request, dispatch, deadline):
+        remaining = deadline - time.monotonic()
+        if not self._can_dispatch(request):
+            self._finish(request, "")
+        elif remaining <= 0:
+            self._finish(request, "prepareFailed")
         else:
-            done(None)
+            self._waiting_rule = _RuleWait(request, dispatch, deadline)
+            self._preparation_timer.start(ceil(remaining * 1000))
+
+    @Slot()
+    def resume_esde_launch(self):
+        pending, self._waiting_rule = self._waiting_rule, None
+        if pending is None:
+            return
+        if not self._can_dispatch(pending.request):
+            self._finish(pending.request, "")
+        elif time.monotonic() >= pending.deadline:
+            self._finish(pending.request, "prepareFailed")
+        else:
+            pending.dispatch()
+
+    def _evaluate(self, request, script, done, deadline):
+        # Keep the original dispatch deadline across proof waits and discovery.
+        # A result from an already-sent action is delivered even after invalidation:
+        # _added must still cache confirmed creation to prevent duplicate shortcuts.
+        problem = ""
+
+        def valid():
+            nonlocal problem
+            if not self._can_dispatch(request) or time.monotonic() >= deadline:
+                return False
+            problem = self._rule_result(request)
+            return problem == "" and self._can_dispatch(request) and time.monotonic() < deadline
+
+        def finished(value):
+            if value is not None:
+                done(value)
+            elif problem is None:
+                self._wait_for_rule(request, dispatch, deadline)
+            elif problem:
+                self._finish(request, "launchBlocked", problem)
+            else:
+                done(None)
+
+        def dispatch():
+            if valid():
+                self._waiting_rule = None
+                self._preparation_timer.stop()
+                eval_js(script, finished, valid=valid)
+            else:
+                finished(None)
+
+        dispatch()
 
     def _added(self, request, options, value):
         if self._request is not request:
@@ -335,11 +400,11 @@ class SteamShortcuts(QObject):
                        lambda value: self._finish(request, "launchRequested" if value is True else "launchFailed"),
                        deadline)
 
-    def _finish(self, request, code):
+    def _finish(self, request, code, detail=None):
         if self._request is not request:
             return
         self._preparation_timer.stop()
-        self._request = None
+        self._request = self._waiting_rule = None
         self.changed.emit()
         if code and request.is_current():
-            self.notice.emit(code, request.title)
+            self.notice.emit(code, request.title if detail is None else detail)

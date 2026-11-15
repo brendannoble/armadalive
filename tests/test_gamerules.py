@@ -1,12 +1,12 @@
-import os, tempfile, threading, unittest
+import json, os, tempfile, threading, unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.common import app
+from tests.common import app, delete_qobject
 from tests.test_runtime import wait_for
 from PySide6.QtCore import QObject, QTimer, Signal
 from armadalive.nowplaying import LegacyIdentities
-from armadalive import gamerules, system
+from armadalive import gamerules, system, emusettings
 
 GAME = dict(kind="game", key="snes/Super Game (EU)", system="snes", playing=True)
 
@@ -17,6 +17,7 @@ class FakeNow(QObject):
     def __init__(self):
         super().__init__()
         self.identities = LegacyIdentities(self)
+        self.processes_known = True
         self.state = dict(GAME)
 
 
@@ -283,8 +284,7 @@ class RuleAcknowledgments(unittest.TestCase):
         self.assertEqual(self.notices, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
+
 
 
 class RulePersistence(unittest.TestCase):
@@ -421,3 +421,562 @@ class RulePersistence(unittest.TestCase):
             self.assertIn("original", coordinator.state["message"])
             self.assertFalse(coordinator.state["busy"])
         self.assertEqual(self.path.read_bytes(), original)
+
+
+class EmulatorRecovery(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.config = self.root / "game_rules.json"
+        self.actual = self.root / "GFX.ini"
+        # Exercise the already-merged Dolphin dialect and preserve exact syntax.
+        self.original = b'[sEtTiNgS]\r\nInternalResolution = "02"  \r\nOther = unchanged\r\n'
+        self.actual.write_bytes(self.original)
+        self.actual.chmod(0o640)
+        self.link = self.root / "linked-GFX.ini"
+        self.link.symlink_to(self.actual.name)
+        self.enterContext(mock.patch.object(gamerules, "CONFIG", self.config))
+        self.enterContext(mock.patch.dict(emusettings.SPECS, {
+            "gc": (self.link, "Settings", "InternalResolution", "{}"),
+            "wii": (self.actual, "Settings", "InternalResolution", "{}"),
+        }))
+        self.config.write_text(json.dumps({"rules": {
+            "system:gc": {"res": 4}, "system:wii": {"res": 5},
+        }}))
+        self.objects = []
+        self.addCleanup(self.dispose_objects)
+        self.rules, self.now = self.new_rules()
+
+    def dispose_objects(self):
+        for obj in reversed(self.objects):
+            delete_qobject(obj)
+
+    def new_rules(self):
+        now, gs, system = FakeNow(), FakeGs(), FakeSys()
+        now.state = {"kind": "", "playing": False}
+        self.objects.extend((now, gs, system))
+        rules = gamerules.GameRules(now, gs, system)
+        self.objects.append(rules)
+        return rules, now
+
+    def select(self, system="gc", now=None):
+        now = now or self.now
+        # A system-scoped rule requires no legacy proof or new identity wrapper.
+        now.state = dict(kind="game", key=f"{system}/Fixture", system=system,
+                         title="Fixture", playing=False)
+        now.changed.emit()
+
+    def assert_original(self):
+        self.assertEqual(self.actual.read_bytes(), self.original)
+        self.assertEqual(self.actual.stat().st_mode & 0o777, 0o640)
+        self.assertTrue(self.link.is_symlink())
+
+    def fail_emulator_replace(self, source, target):
+        if Path(target) == self.actual:
+            raise OSError("temporary emulator replacement failure")
+        return self.real_replace(source, target)
+
+    def test_shared_dolphin_target_keeps_first_original_across_systems(self):
+        self.select("gc")
+        self.assertEqual(emusettings.read("gc"), "4")
+        self.select("wii")
+        self.assertEqual(emusettings.read("wii"), "5")
+        self.rules.remove("system:wii")
+        self.select("wii")
+        self.assert_original()
+
+    def test_restart_recovers_original_without_a_later_rule_edit(self):
+        self.select()
+        self.assertEqual(emusettings.read("gc"), "4")
+        self.new_rules()
+        self.assert_original()
+
+    def test_failed_original_persistence_prevents_emulator_mutation(self):
+        # Reject all JSON persistence, regardless of journal layout/name. The
+        # existing emulator writer uses write_bytes and would otherwise succeed.
+        with mock.patch.object(gamerules.persistence, "write_json",
+                               side_effect=OSError("cannot make original durable")):
+            self.select()
+        self.assert_original()
+
+    def test_failed_restore_can_retry_without_forgetting_original(self):
+        self.select()
+        self.rules.remove("system:gc")
+        self.real_replace = os.replace
+        with mock.patch("os.replace", side_effect=self.fail_emulator_replace):
+            self.select()
+        self.assertEqual(emusettings.read("gc"), "4")
+        self.select()
+        self.assert_original()
+
+    def test_failed_restore_survives_a_rule_save_and_restart(self):
+        self.select()
+        self.rules.remove("system:gc")
+        self.real_replace = os.replace
+        with mock.patch("os.replace", side_effect=self.fail_emulator_replace):
+            self.select()
+            # Public settings write must not erase failed-restore evidence.
+            self.rules.setEnabled(True)
+        self.new_rules()
+        self.assert_original()
+
+    def test_legacy_handoff_restores_known_target_and_retains_unknown_and_null(self):
+        legacy = {"gc": "02", "unavailable-emulator": "retained exact text", "ps2": None}
+        self.config.write_text(json.dumps({"rules": {}, "base": legacy}))
+        self.assertTrue(emusettings.write("gc", 4))
+        self.new_rules()
+        # Independent subtests also expose compatibility already present on base.
+        with self.subTest("known original recovered"):
+            self.assert_original()
+        saved_base = json.loads(self.config.read_text()).get("base", {})
+        with self.subTest("unsupported original retained"):
+            self.assertEqual(saved_base.get("unavailable-emulator"), legacy["unavailable-emulator"])
+        with self.subTest("null original retained"):
+            self.assertIn("ps2", saved_base)
+            self.assertIsNone(saved_base["ps2"])
+        with self.subTest("known original handed off once"):
+            self.assertNotIn("gc", saved_base)
+
+    def test_ordinary_rule_save_preserves_unknown_and_null_legacy_originals(self):
+        legacy = {"unavailable-emulator": "retained exact text", "ps2": None}
+        self.config.write_text(json.dumps({"rules": {}, "base": legacy}))
+        rules, _ = self.new_rules()
+        rules.setEnabled(False)
+        self.assertEqual(json.loads(self.config.read_text())["base"], legacy)
+        self.assert_original()
+
+    def test_failed_legacy_handoff_preserves_all_local_originals(self):
+        legacy = {"gc": "02", "unavailable-emulator": "retained exact text", "ps2": None}
+        self.config.write_text(json.dumps({"rules": {}, "base": legacy}))
+        self.assertTrue(emusettings.write("gc", 4))
+        before = self.actual.read_bytes()
+        with mock.patch.object(gamerules.persistence, "write_json",
+                               side_effect=OSError("cannot hand off originals")):
+            self.new_rules()
+        self.assertEqual(self.actual.read_bytes(), before)
+        self.assertEqual(json.loads(self.config.read_text())["base"], legacy)
+
+
+    def test_disable_during_play_defers_restore_until_exit_and_retries_failure(self):
+        self.select()
+        notices = []
+        self.rules.notice.connect(lambda code, detail: notices.append(code))
+        self.now.state['playing'] = True
+        self.now.changed.emit()
+        self.rules.setEnabled(False)
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertIn('resolutionRestorePending', notices)
+        self.real_replace = os.replace
+        with mock.patch('os.replace', side_effect=self.fail_emulator_replace):
+            self.select()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.new_rules()
+        self.assert_original()
+
+    def test_disable_while_idle_restores_immediately(self):
+        self.select()
+        self.rules.setEnabled(False)
+        self.assert_original()
+
+    def test_failed_journal_unlink_is_repaired_before_another_override(self):
+        self.select()
+        remove = gamerules.persistence.remove
+        def fail_after_unlink(path):
+            remove(path)
+            raise OSError('directory sync failed after unlink')
+        with mock.patch.object(gamerules.persistence, 'remove', side_effect=fail_after_unlink):
+            self.rules.setEnabled(False)
+        self.assert_original()
+        self.rules.setEnabled(True)
+        with mock.patch.object(gamerules.persistence, 'write_json', side_effect=OSError('cannot recommit')):
+            self.select()
+        self.assert_original()
+        self.select()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.new_rules()
+        self.assert_original()
+
+    def test_failed_journal_durability_does_not_mutate_emulator(self):
+        write = gamerules.persistence.write_json
+        def fail_after_commit(path, data, **kwargs):
+            result = write(path, data, **kwargs)
+            if Path(path).name == 'emulator_undo.json':
+                raise OSError('directory sync failed after replacement')
+            return result
+        with mock.patch.object(gamerules.persistence, 'write_json', side_effect=fail_after_commit):
+            self.select()
+        self.assert_original()
+        self.new_rules()
+        self.assert_original()
+
+    def test_failed_legacy_rules_save_retains_legacy_and_durable_journal_for_retry(self):
+        self.config.write_text(json.dumps({'rules': {}, 'base': {'gc': '02', 'other': 'keep'}}))
+        emusettings.write('gc', 4)
+        write = gamerules.persistence.write_json
+        def fail_rules(path, data, **kwargs):
+            if Path(path) == self.config:
+                raise OSError('cannot finish handoff')
+            return write(path, data, **kwargs)
+        with mock.patch.object(gamerules.persistence, 'write_json', side_effect=fail_rules):
+            self.new_rules()
+        self.assertEqual(json.loads(self.config.read_text())['base']['gc'], '02')
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.new_rules()
+        self.assert_original()
+        self.assertEqual(json.loads(self.config.read_text())['base'], {'other': 'keep'})
+
+    def test_conflicting_legacy_shared_originals_preserve_evidence(self):
+        legacy = {'gc': '02', 'wii': '3'}
+        self.config.write_text(json.dumps({'base': legacy}))
+        emusettings.write('gc', 4)
+        self.new_rules()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertEqual(json.loads(self.config.read_text())['base'], legacy)
+
+    def test_malformed_journal_is_not_replaced_or_used_to_override(self):
+        journal = self.root / 'emulator_undo.json'
+        journal.write_text('not a journal')
+        rules, now = self.new_rules()
+        self.select(now=now)
+        self.assert_original()
+        self.assertEqual(journal.read_text(), 'not a journal')
+
+    def test_missing_or_ambiguous_original_is_not_created_or_replaced(self):
+        for content in ('[Settings]\nOther=1\n', '[Settings]\nInternalResolution=2\nInternalResolution=3\n'):
+            with self.subTest(content=content):
+                self.actual.write_text(content)
+                self.select()
+                self.assertEqual(self.actual.read_text(), content)
+                self.assertFalse((self.root / 'emulator_undo.json').exists())
+
+    def test_invalid_compatible_saved_resolution_is_retained_but_not_applied(self):
+        for resolution in (-1, 6, 2.5, True):
+            with self.subTest(resolution=resolution):
+                self.rules._rules['system:gc']['res'] = resolution
+                self.rules._save()
+                self.select()
+                self.assert_original()
+                self.assertEqual(json.loads(self.config.read_text())['rules']['system:gc']['res'], resolution)
+
+    def test_retargeted_symlink_does_not_restore_old_original_into_new_file(self):
+        self.select()
+        alternate = self.root / 'alternate.ini'
+        alternate.write_text('[Settings]\nInternalResolution=3\n')
+        self.link.unlink()
+        self.link.symlink_to(alternate.name)
+        # Wii still proves the original physical target, so use only retargeted gc.
+        with mock.patch.dict(emusettings.SPECS, {'wii': emusettings.SPECS['gc']}):
+            self.rules.setEnabled(False)
+        self.assertEqual(alternate.read_text(), '[Settings]\nInternalResolution=3\n')
+        self.assertTrue((self.root / 'emulator_undo.json').exists())
+
+    def launch_state(self, path='Fixture.iso'):
+        from armadalive import nowplaying
+        self.enterContext(mock.patch.object(nowplaying, '_rom_configuration', return_value=(str(self.root), {})))
+        return str(self.root / 'gc' / path)
+
+    def test_launch_hold_is_not_extended_and_timeout_recovers(self):
+        path = self.launch_state()
+        self.assertEqual(self.rules.prepare_esde_launch('gc', path, 'Fixture'), '')
+        deadline = self.rules._launch_deadline
+        self.now.state = {'kind': 'idle', 'playing': False, 'title': 'Metadata update'}
+        self.now.changed.emit()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertEqual(self.rules.prepare_esde_launch('gc', path, 'Fixture'), '')
+        self.assertEqual(self.rules._launch_deadline, deadline)
+        self.rules._launch_hold.timeout.emit()
+        self.assert_original()
+
+    def test_backup_pause_defers_expired_hold_recovery_until_resume(self):
+        path = self.launch_state()
+        self.rules.prepare_esde_launch('gc', path, 'Fixture')
+        self.rules.pauseWrites(restoring=True)
+        self.rules._launch_hold.timeout.emit()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertTrue(self.rules.prepare_esde_launch('gc', path, 'Fixture'))
+        self.rules.resumeWrites()
+        self.assert_original()
+
+    def test_pending_proof_waits_only_when_resolution_can_change(self):
+        path = self.launch_state()
+        self.rules._rules = {'game:gc/Fixture': {'profile': 'Eco'}}
+        self.rules._save()
+        with mock.patch.object(self.now.identities, 'identity', return_value=None):
+            self.assertEqual(self.rules.prepare_esde_launch('gc', path, 'Fixture'), '')
+            self.rules._rules['system:gc'] = {'res': 3}
+            self.assertIsNone(self.rules.prepare_esde_launch('gc', path, 'Fixture'))
+        self.assert_original()
+
+    def test_unproved_identity_uses_system_resolution_without_waiting(self):
+        path = self.launch_state()
+        self.rules._rules['game:gc/Fixture'] = {'res': 5}
+        self.rules._save()
+        with mock.patch.object(self.now.identities, 'identity', return_value=''):
+            self.assertEqual(self.rules.prepare_esde_launch('gc', path, 'Fixture'), '')
+        self.assertEqual(emusettings.read('gc'), '4')
+
+    def test_late_proof_notifies_once_without_mutating_running_emulator(self):
+        self.rules._rules = {'game:gc/Fixture': {'res': 5}}
+        self.rules._save()
+        seen = []
+        self.rules.notice.connect(lambda code, detail: seen.append(code))
+        self.now.state = dict(kind='game', key='esde:gc/Fixture.iso', system='gc', title='Fixture', playing=True)
+        with mock.patch.object(self.now.identities, 'identity', return_value=None):
+            self.now.changed.emit()
+        with mock.patch.object(self.now.identities, 'identity', return_value='esde:gc/Fixture.iso'):
+            self.now.identities.changed.emit()
+            self.now.changed.emit()
+        self.assert_original()
+        self.assertEqual(seen.count('resolutionNextLaunch'), 1)
+
+    def test_consumed_legacy_original_cannot_return_from_rules_backup(self):
+        self.config.write_text(json.dumps({'rules': {}, 'base': {'gc': '02'}}))
+        emusettings.write('gc', 4)
+        self.new_rules()
+        self.assert_original()
+        emusettings.write('gc', 3)
+        self.config.write_text('damaged primary')
+        self.new_rules()
+        self.assertEqual(emusettings.read('gc'), '3')
+
+    def test_expired_launch_does_not_reapply_on_unrelated_selected_metadata(self):
+        path = self.launch_state()
+        from armadalive import nowplaying
+        self.now.state, _ = nowplaying._esde_selection(dict(event='game-select', system='gc', path=path))
+        self.rules.prepare_esde_launch('gc', path, 'Fixture')
+        self.rules._launch_hold.timeout.emit()
+        self.assert_original()
+        self.now.state['title'] = 'Metadata arrived'
+        self.now.changed.emit()
+        self.assert_original()
+
+    def test_handoff_preserves_each_rules_copy_and_retries_partial_backup_update(self):
+        primary = {'rules': {'system:gc': {'title': 'current'}}, 'base': {'gc': '02', 'unknown': 'current-local'}}
+        previous = {'rules': {'system:gc': {'title': 'previous'}}, 'base': {'gc': '02', 'unknown': 'previous-local'}, 'optional': 7}
+        self.config.write_text(json.dumps(primary))
+        backup_path = Path(str(self.config) + '.bak')
+        backup_path.write_text(json.dumps(previous))
+        backup_path.chmod(0o640)
+        emusettings.write('gc', 4)
+        write = gamerules.persistence.write_json
+        def fail_backup(path, data, **kwargs):
+            if Path(path) == backup_path:
+                raise OSError('backup copy unavailable')
+            return write(path, data, **kwargs)
+        with mock.patch.object(gamerules.persistence, 'write_json', side_effect=fail_backup):
+            self.new_rules()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertTrue((self.root / 'emulator_undo.json').exists())
+        self.new_rules()
+        self.assert_original()
+        self.assertEqual(json.loads(self.config.read_text())['rules'], primary['rules'])
+        previous['base'].pop('gc')
+        self.assertEqual(json.loads(backup_path.read_text()), previous)
+        self.assertEqual(backup_path.stat().st_mode & 0o777, 0o640)
+
+    def test_restore_visible_before_failed_directory_sync_requires_durable_retry(self):
+        self.select()
+        self.rules.remove('system:gc')
+        write = gamerules.persistence.write_bytes
+        def fail_after_emulator_replacement(path, data, **kwargs):
+            result = write(path, data, **kwargs)
+            if Path(path) == self.actual:
+                raise OSError('directory sync failed after replacement')
+            return result
+        with mock.patch.object(gamerules.persistence, 'write_bytes', side_effect=fail_after_emulator_replacement):
+            self.select()
+        self.assert_original()
+        self.assertTrue((self.root / 'emulator_undo.json').exists())
+        # The option already equals its original. Fail the explicit sync after
+        # that no-write update, not an earlier handoff durability check.
+        sync, update, attempted = gamerules.persistence._sync_directory, emusettings.update_setting, []
+        def unchanged_update(*args):
+            result = update(*args)
+            attempted.append(True)
+            return result
+        def fail_restore_sync(path):
+            if attempted:
+                raise OSError('restore retry sync failed')
+            return sync(path)
+        with mock.patch.object(emusettings, 'update_setting', side_effect=unchanged_update), \
+                mock.patch.object(gamerules.persistence, '_sync_directory', side_effect=fail_restore_sync):
+            self.select()
+        self.assertTrue(attempted)
+        self.assertTrue((self.root / 'emulator_undo.json').exists())
+        self.select()
+        self.assertFalse((self.root / 'emulator_undo.json').exists())
+
+    def test_pending_proof_with_same_resolution_does_not_delay_launch(self):
+        path = self.launch_state()
+        self.rules._rules['game:gc/Fixture'] = {'res': 4}
+        self.rules._save()
+        with mock.patch.object(self.now.identities, 'identity', return_value=None):
+            self.assertEqual(self.rules.prepare_esde_launch('gc', path, 'Fixture'), '')
+        self.assertEqual(emusettings.read('gc'), '4')
+
+    def test_legacy_handoff_preserves_primary_symlink_and_mode(self):
+        target = self.root / 'actual-rules.json'
+        self.config.rename(target)
+        self.config.symlink_to(target.name)
+        target.write_text(json.dumps({'rules': {}, 'base': {'gc': '02'}}))
+        target.chmod(0o640)
+        emusettings.write('gc', 4)
+        self.new_rules()
+        self.assert_original()
+        self.assertTrue(self.config.is_symlink())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(json.loads(target.read_text())['base'], {})
+
+    def test_failed_journal_shrink_preserves_all_originals_through_retry(self):
+        alternate = self.root / 'other.ini'
+        alternate.write_text('[Settings]\nInternalResolution=5\n')
+        emusettings.write('gc', 4)
+        journal = self.root / 'emulator_undo.json'
+        journal.write_text(json.dumps([
+            [str(self.actual), 'Settings', 'InternalResolution', '02'],
+            [str(alternate), 'Settings', 'InternalResolution', '3'],
+        ]))
+        write, self.real_replace = gamerules.persistence.write_json, os.replace
+        def fail_after_shrink(path, data, **kwargs):
+            result = write(path, data, **kwargs)
+            if Path(path) == journal and len(data) == 1:
+                raise OSError('directory sync failed after shrink')
+            return result
+        with mock.patch.dict(emusettings.SPECS, {'psp': (alternate, 'Settings', 'InternalResolution', '{}')}):
+            with mock.patch('os.replace', side_effect=self.fail_emulator_replace), \
+                    mock.patch.object(gamerules.persistence, 'write_json', side_effect=fail_after_shrink):
+                rules, now = self.new_rules()
+            self.assertEqual(len(json.loads(journal.read_text())), 1)
+            self.select('wii', now=now)
+            self.assertEqual(emusettings.read('gc'), '5')
+            self.new_rules()
+            self.assert_original()
+            self.assertEqual(emusettings.read('psp'), '3')
+
+
+    def test_handoff_retires_lexical_and_real_backups_for_a_symlink_primary(self):
+        target = self.root / 'actual-rules.json'
+        self.config.rename(target)
+        self.config.symlink_to(target.name)
+        target.write_text(json.dumps({'rules': {}, 'base': {'gc': '02'}}))
+        lexical = Path(str(self.config) + '.bak')
+        real = Path(str(target) + '.bak')
+        copies = [(lexical, {'rules': {'system:gc': {'title': 'lexical'}},
+                            'base': {'gc': '02', 'unknown': 'lexical-local', 'ps2': None}}),
+                  (real, {'rules': {'system:gc': {'title': 'real'}},
+                          'base': {'gc': '02', 'unknown': 'real-local', 'ps2': None}})]
+        for path, saved in copies:
+            path.write_text(json.dumps(saved))
+            path.chmod(0o640)
+        emusettings.write('gc', 4)
+        self.new_rules()
+        self.assert_original()
+        for path, saved in copies:
+            with self.subTest(path=path.name):
+                saved['base'].pop('gc')
+                self.assertEqual(json.loads(path.read_text()), saved)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        emusettings.write('gc', 3)
+        target.write_text('damaged primary')
+        self.new_rules()
+        self.assertEqual(emusettings.read('gc'), '3')
+        self.assertTrue(self.config.is_symlink())
+
+    def test_unrelated_observed_play_keeps_the_prepared_identity_hold(self):
+        path = self.launch_state()
+        self.assertEqual(self.rules.prepare_esde_launch('gc', path, 'Fixture'), '')
+        held, deadline = self.rules._launch_key, self.rules._launch_deadline
+        self.now.state = dict(kind='game', key='esde:psp/Other.iso', system='psp', playing=True)
+        self.now.running = True
+        self.now.changed.emit()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertEqual(self.rules._launch_key, held)
+        self.assertEqual(self.rules._launch_deadline, deadline)
+        self.now.state = dict(kind='game', key=held, system='gc', playing=True)
+        self.now.changed.emit()
+        self.assertEqual(self.rules._launch_key, '')
+        self.assertEqual(emusettings.read('gc'), '4')
+
+    def test_unrelated_observed_play_still_allows_hold_timeout_recovery(self):
+        path = self.launch_state()
+        self.rules.prepare_esde_launch('gc', path, 'Fixture')
+        self.now.state = dict(kind='game', key='esde:psp/Other.iso', system='psp', playing=True)
+        self.now.running = True
+        self.now.changed.emit()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.rules._launch_hold.timeout.emit()
+        self.assert_original()
+
+    def test_running_game_does_not_block_noop_launch_with_disabled_or_absent_rules(self):
+        path = self.launch_state()
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                self.rules._rules = {}
+                self.rules.setEnabled(enabled)
+                self.now.state = dict(kind='game', key='esde:gc/Other.iso', system='gc', playing=True)
+                self.now.running = True
+                self.assertEqual(self.rules.prepare_esde_launch('gc', path, 'Fixture'), '')
+                self.assert_original()
+
+    def test_running_game_still_blocks_required_override_or_restoration(self):
+        path = self.launch_state()
+        self.now.state = dict(kind='game', key='esde:gc/Other.iso', system='gc', playing=True)
+        self.now.running = True
+        self.assertTrue(self.rules.prepare_esde_launch('gc', path, 'Fixture'))
+        self.assert_original()
+        self.now.running = False
+        self.select()
+        self.now.state['playing'] = True
+        self.now.running = True
+        self.rules.setEnabled(False)
+        self.assertTrue(self.rules.prepare_esde_launch('gc', path, 'Fixture'))
+        self.assertEqual(emusettings.read('gc'), '4')
+
+    def assert_late_removal_notifies(self, rule):
+        self.select()  # Prepare system resolution 4 and retain original 02.
+        self.rules._rules['game:gc/Fixture'] = rule
+        self.rules._save()
+        seen = []
+        self.rules.notice.connect(lambda code, detail: seen.append(code))
+        self.now.state = dict(kind='game', key='esde:gc/Fixture.iso', system='gc', title='Fixture', playing=True)
+        self.now.running = True
+        with mock.patch.object(self.now.identities, 'identity', return_value=None):
+            self.now.changed.emit()
+        with mock.patch.object(self.now.identities, 'identity', return_value='esde:gc/Fixture.iso'):
+            self.now.identities.changed.emit()
+            self.now.changed.emit()
+            self.assertEqual(emusettings.read('gc'), '4')
+            self.assertEqual(seen.count('resolutionNextLaunch'), 1)
+            self.now.running = False
+            self.now.state['playing'] = False
+            self.now.changed.emit()
+        self.assert_original()
+
+    def test_profile_only_late_proof_announces_removal_without_running_mutation(self):
+        self.assert_late_removal_notifies({'profile': 'Eco'})
+
+    def test_zero_resolution_late_proof_announces_removal_without_running_mutation(self):
+        self.assert_late_removal_notifies({'res': 0})
+
+
+    def test_launch_can_prepare_idle_target_without_touching_running_target(self):
+        path = self.launch_state()
+        other = self.root / 'other.ini'
+        other.write_text('[Settings]\nInternalResolution=3\n')
+        with mock.patch.dict(emusettings.SPECS, {'psp': (other, 'Settings', 'InternalResolution', '{}')}):
+            self.rules._rules['system:psp'] = {'res': 5}
+            self.rules._save()
+            self.select('psp')
+            self.now.state['playing'] = True
+            self.now.running = True
+            self.assertEqual(self.rules.prepare_esde_launch('gc', path, 'Fixture'), '')
+            self.assertEqual(other.read_text(), '[Settings]\nInternalResolution=5\n')
+            self.assertEqual(emusettings.read('gc'), '4')
+            self.now.running = False
+            self.now.state = {'kind': 'idle', 'playing': False}
+            self.rules._launch_hold.timeout.emit()
+            self.assert_original()
+            self.assertEqual(other.read_text(), '[Settings]\nInternalResolution=3\n')
+
+
+if __name__ == "__main__":
+    unittest.main()

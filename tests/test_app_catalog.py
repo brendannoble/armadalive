@@ -389,7 +389,15 @@ class EntryPoint(unittest.TestCase):
             self.assertEqual(startup.mock_calls[:2], [
                 mock.call.recover_restore(startup=True), mock.call.application(entry.sys.argv)])
             coordinator = constructors['SteamShortcuts'].return_value
-            constructors['SteamShortcuts'].assert_called_once_with(constructors['NowPlaying'].return_value)
+            constructors['SteamShortcuts'].assert_called_once_with(
+                constructors['NowPlaying'].return_value,
+                prepare_esde_launch=constructors['GameRules'].return_value.prepare_esde_launch)
+            constructors['NowPlaying'].return_value.changed.connect.assert_called_once_with(
+                coordinator.resume_esde_launch)
+            constructors['NowPlaying'].return_value.identities.changed.connect.assert_called_once_with(
+                coordinator.resume_esde_launch)
+            constructors['GameRules'].return_value.changed.connect.assert_called_once_with(
+                coordinator.resume_esde_launch)
             constructors['Apps'].assert_called_once_with(constructors['History'].return_value, coordinator)
             context = constructors['QQmlApplicationEngine'].return_value.rootContext.return_value
             context.setContextProperty.assert_any_call('steamShortcuts', coordinator)

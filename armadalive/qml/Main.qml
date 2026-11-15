@@ -391,7 +391,8 @@ Window {
             const text = ({ created: Tr.t("Shortcut created"), exists: Tr.t("Already in Steam"), unknown: Tr.t("Launch the game from ES-DE once first"),
                             unreachable: Tr.t("Steam could not complete the shortcut"), prepareFailed: Tr.t("Could not prepare the Steam shortcut"),
                             launchUnavailable: Tr.t("No launch command is available"), launchFailed: Tr.t("Steam could not start the game"),
-                            launchRequested: Tr.t("Launch requested") })[code]
+                            launchRequested: Tr.t("Launch requested"), launchBlocked: Tr.t("Launch blocked") })[code]
+            if (code === "launchBlocked") detail = Tr.t(detail)
             if (text) toast.show(detail && code !== "unknown" ? text + ": " + detail : text, code !== "created" && code !== "launchRequested")
         }
     }
@@ -400,7 +401,8 @@ Window {
         target: rules
         function onNotice(code, detail) {
             const text = ({ saved: Tr.t("Rule saved"), removed: Tr.t("Rule removed"), loaded: Tr.t("Rule loaded"),
-                            failed: Tr.t("Rule failed") })[code]
+                            failed: Tr.t("Rule failed"), resolutionNextLaunch: Tr.t("Resolution rule applies on the next launch"),
+                            resolutionRestorePending: Tr.t("Emulator resolution will be restored after the game closes") })[code]
             toast.show(text + ": " + detail, code === "failed")
         }
     }

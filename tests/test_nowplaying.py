@@ -1,10 +1,11 @@
-import os, builtins, tempfile, threading, time, unittest
+import json, os, builtins, tempfile, threading, time, unittest
+from pathlib import Path
 from unittest import mock
 
 from PySide6.QtCore import QTimer
 
 from tests.common import GAME, ROMS, Fake, dispose_qt, touch, wait_for
-from armadalive import gamerules, history, nowplaying as n
+from armadalive import emusettings, gamerules, history, nowplaying as n, steamshortcuts
 
 
 class Describe(unittest.TestCase):
@@ -367,6 +368,159 @@ class RunningGame(unittest.TestCase):
             with a, b, c, mock.patch.object(n, "_same_file", return_value=True):
                 game = n.running_game()
             self.assertEqual((game["system"], game["name"]), ("gbc", "Pokemon - Silver"))
+
+
+class InitialProcessRecovery(unittest.TestCase):
+    def setUp(self):
+        from tests.test_gamerules import FakeGs, FakeSys
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.config, self.actual = self.root / 'game_rules.json', self.root / 'GFX.ini'
+        self.journal = self.root / 'emulator_undo.json'
+        self.config.write_text(json.dumps({'enabled': False, 'rules': {}}))
+        self.actual.write_text('[Settings]\nInternalResolution=4\n')
+        self.journal.write_text(json.dumps([[str(self.actual), 'Settings', 'InternalResolution', '02']]))
+        self.enterContext(mock.patch.object(gamerules, 'CONFIG', self.config))
+        self.enterContext(mock.patch.dict(emusettings.SPECS, {'gc': (self.actual, 'Settings', 'InternalResolution', '{}')}))
+        self.enterContext(mock.patch.object(n, 'STATE', str(self.root / 'absent-state.json')))
+        self.enterContext(mock.patch.object(n, '_rom_configuration', return_value=(str(self.root), {})))
+        self.enterContext(mock.patch.object(n, 'esde_running', return_value=False))
+        self.enterContext(mock.patch.object(n, 'steam_running', return_value=False))
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.game, self.failed = None, False
+        def reader():
+            self.entered.set()
+            if not self.release.wait(3):
+                raise TimeoutError('test did not release initial process observation')
+            if self.failed:
+                raise OSError('initial process observation unavailable')
+            return self.game
+        self.enterContext(mock.patch.object(n, 'running_game', side_effect=reader))
+        self.now = n.NowPlaying(Fake(), Fake())
+        self.gs, self.system = FakeGs(), FakeSys()
+        self.objects = [self.now, self.gs, self.system]
+        self.addCleanup(self.close_objects)
+        self.assertTrue(self.entered.wait(1))
+
+    def close_objects(self):
+        self.release.set()
+        for timer in self.now.findChildren(QTimer):
+            timer.stop()
+        for obj in reversed(self.objects):
+            dispose_qt(obj)
+
+    def rules(self):
+        rules = gamerules.GameRules(self.now, self.gs, self.system)
+        self.objects.append(rules)
+        return rules
+
+    def observe(self, game=None):
+        self.game = game
+        self.release.set()
+        wait_for(lambda: not self.now._procs._busy)
+
+    def test_disabled_app_restart_retains_active_override_before_and_after_first_scan(self):
+        self.rules()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertTrue(self.journal.exists())
+        game = dict(event='game-start', system='gc', path=str(self.root / 'gc/Fixture.iso'))
+        self.observe(game)
+        self.assertTrue(self.now.running)
+        self.assertTrue(self.now.state['playing'])
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertTrue(self.journal.exists())
+        self.game = None
+        self.now._procs.kick()
+        wait_for(lambda: not self.now.running)
+        self.assertEqual(emusettings.read('gc'), '02')
+        self.assertFalse(self.journal.exists())
+
+    def test_initial_idle_observation_notifies_and_releases_deferred_recovery(self):
+        self.rules()
+        notices = []
+        self.now.changed.connect(lambda: notices.append(self.now.running))
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.observe()
+        self.assertEqual(notices, [False])
+        self.assertEqual(emusettings.read('gc'), '02')
+        self.assertFalse(self.journal.exists())
+
+    def test_failed_initial_scan_retains_recovery_until_successful_retry(self):
+        self.rules()
+        self.failed = True
+        self.observe()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertTrue(self.journal.exists())
+        self.failed = False
+        self.now._procs.kick()
+        wait_for(lambda: not self.now._procs._busy)
+        self.assertEqual(emusettings.read('gc'), '02')
+        self.assertFalse(self.journal.exists())
+
+    def test_first_idle_observation_respects_backup_freeze(self):
+        rules = self.rules()
+        rules.pauseWrites(restoring=True)
+        self.observe()
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertTrue(self.journal.exists())
+        rules.resumeWrites()
+        self.assertEqual(emusettings.read('gc'), '02')
+        self.assertFalse(self.journal.exists())
+
+    def test_unknown_observation_does_not_delay_a_noop_launch(self):
+        self.journal.unlink()
+        rules = self.rules()
+        path = str(self.root / 'gc/Fixture.iso')
+        self.assertEqual(rules.prepare_esde_launch('gc', path, 'Fixture'), '')
+        self.assertEqual(emusettings.read('gc'), '4')
+
+    def launch_waiting_for_observation(self):
+        from tests.test_steamshortcuts import close_shortcuts
+        self.journal.unlink()
+        self.actual.write_text('[Settings]\nInternalResolution=02\n')
+        self.config.write_text(json.dumps({'rules': {'system:gc': {'res': 4}}}))
+        rules = self.rules()
+        coordinator = steamshortcuts.SteamShortcuts(prepare_esde_launch=rules.prepare_esde_launch)
+        self.addCleanup(close_shortcuts, coordinator)
+        self.now.changed.connect(coordinator.resume_esde_launch)
+        rules.changed.connect(coordinator.resume_esde_launch)
+        self.sent, self.notices = [], []
+        coordinator.notice.connect(lambda code, detail: self.notices.append(code))
+        def dispatch(script, done, **kwargs):
+            if kwargs['valid']():
+                self.sent.append(script)
+                done(True)
+            else:
+                done(None)
+        self.enterContext(mock.patch.object(steamshortcuts, 'known_appid', return_value=123))
+        self.enterContext(mock.patch.object(steamshortcuts, 'eval_js', side_effect=dispatch))
+        coordinator.launch('Fixture', 'gc', str(self.root / 'gc/Fixture.iso'),
+                           lambda *_: ['/usr/bin/emu', 'fixture'], lambda: True)
+        wait_for(lambda: coordinator._preparing is None)
+        return coordinator
+
+    def test_first_idle_observation_resumes_the_existing_launch_coordinator(self):
+        coordinator = self.launch_waiting_for_observation()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(emusettings.read('gc'), '02')
+        self.assertTrue(coordinator.state['busy'])
+        self.observe()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.notices, ['launchRequested'])
+        self.assertEqual(emusettings.read('gc'), '4')
+        self.assertFalse(coordinator.state['busy'])
+
+    def test_delayed_first_observation_cannot_renew_launch_deadline(self):
+        from types import SimpleNamespace
+        clock = [10.0]
+        with mock.patch.object(steamshortcuts, 'time', SimpleNamespace(monotonic=lambda: clock[0])):
+            coordinator = self.launch_waiting_for_observation()
+            self.assertEqual(self.sent, [])
+            clock[0] = 15.0
+            self.observe()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.notices, ['prepareFailed'])
+        self.assertEqual(emusettings.read('gc'), '02')
+        self.assertFalse(coordinator.state['busy'])
 
 
 if __name__ == "__main__":
