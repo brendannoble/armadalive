@@ -221,6 +221,7 @@ for item in $targets; do replace "$item"; done
 reload_attempted=1
 systemctl --user daemon-reload
 restart_attempted=1
+# Keep the backups until the blocking restart reports window startup or failure.
 systemctl --user restart armadalive
 systemctl --user is-active --quiet armadalive
 if [ "$was_enabled" != enabled ]; then

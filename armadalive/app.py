@@ -1,4 +1,4 @@
-import json, os, signal, sys
+import json, os, signal, socket, sys
 from PySide6.QtCore import QObject, QPoint, QTimer, QUrl, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
@@ -46,7 +46,21 @@ from .emulator_control import EmulatorControl
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def _notify_ready(app, address):
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notification:
+            notification.setblocking(False)
+            notification.sendto(b"READY=1", address)
+    except OSError as error:
+        print(f"ArmadaLive: could not send startup notification: {error}", file=sys.stderr)
+        app.exit(1)
+
+
 def main():
+    # Reserve the service manager's notification address for this process.
+    notify_address = os.environ.pop("NOTIFY_SOCKET", None)
     app = QGuiApplication(sys.argv)
     app.setApplicationName("ArmadaLive")
     app.setApplicationVersion(__version__)
@@ -79,12 +93,13 @@ def main():
     wake.timeout.connect(lambda: None)  # keeps the interpreter running so it notices the signal
     wake.start(250)
     engine.load(QUrl.fromLocalFile(HERE + "/qml/Main.qml"))
-    if not engine.rootObjects():
+    roots = engine.rootObjects()
+    if not roots or not isinstance(roots[0], QQuickWindow):
         return 1
+    window = roots[0]
     if "--snapshot" in sys.argv:  # render the first frames to a PNG and exit, for docs and tests
         out = sys.argv[sys.argv.index("--snapshot") + 1]
         page = int(sys.argv[sys.argv.index("--page") + 1]) if "--page" in sys.argv else 0
-        window = engine.rootObjects()[0]
         # a snapshot always shows a fixed game state, otherwise whatever ES-DE or Steam is doing at that moment throws the page
         # back to "Game": {"event": {...}} like ES-DE sends, or {"ui": [appid, "name"]} for Steam's UI; none means idle
         demo = json.loads(sys.argv[sys.argv.index("--demo") + 1]) if "--demo" in sys.argv else {}
@@ -138,4 +153,7 @@ def main():
             QTimer.singleShot(int(sys.argv[sys.argv.index("--close-demo") + 1]), lambda: backends["pad"].feed("demo", press))
         delay = int(sys.argv[sys.argv.index("--delay") + 1]) if "--delay" in sys.argv else 3000
         QTimer.singleShot(delay, lambda: (print("dimmed:", window.property("dimmed")), QQuickWindow.grabWindow(window).save(out), app.quit()))
+    elif notify_address:
+        # Confirm startup from inside the event loop.
+        QTimer.singleShot(0, lambda: _notify_ready(app, notify_address))
     return app.exec()

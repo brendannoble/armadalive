@@ -3,6 +3,11 @@ Description=ArmadaLive (bottom screen companion)
 After=armada-bottom-screen.service
 
 [Service]
+Type=notify
+# The bottom-display fallback launcher keeps Python as a child process.
+NotifyAccess=all
+# The launcher can spend up to 60 seconds waiting for a display by default.
+TimeoutStartSec=90s
 Environment=QT_QPA_PLATFORM=wayland WAYLAND_DISPLAY=armada-plasma-bottom QT_QUICK_CONTROLS_STYLE=Basic
 Environment=PYTHONPATH=%h/.local/share/armadalive
 ExecStart=%h/.local/share/armadalive/scripts/run.sh
