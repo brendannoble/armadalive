@@ -73,6 +73,36 @@ class Runtime(unittest.TestCase):
         self.assertNotIn(owner, reads)
         self.assertEqual(fps, [owner])
 
+    def test_explicitly_scheduled_poller_never_arms_an_automatic_timer(self):
+        entered, release = threading.Event(), threading.Event()
+        reads, applied = [], []
+
+        def read():
+            reads.append(len(reads) + 1)
+            if reads[-1] == 1:
+                entered.set()
+                release.wait(2)
+            return reads[-1]
+
+        with runtime_object(QObject()) as owner:
+            poller = Poller(owner, read, applied.append, 0, now=False)
+            app.processEvents()
+            self.assertFalse(poller._timer.isActive())
+            self.assertEqual(reads, [])
+            poller.kick()
+            self.assertTrue(entered.wait(1))
+            try:
+                poller.refresh()
+                poller.refresh()
+            finally:
+                release.set()
+            self.assertTrue(wait_for(lambda: applied == [2]))
+            self.assertEqual(reads, [1, 2])
+            self.assertFalse(poller._timer.isActive())
+            poller.kick()
+            self.assertTrue(wait_for(lambda: applied == [2, 3]))
+            self.assertFalse(poller._timer.isActive())
+
     def test_a_queued_result_keeps_the_worker_busy_until_delivery(self):
         reads = []
         applied = []

@@ -31,8 +31,11 @@ def _replace(path, content, mode=None):
             if mode is not None:
                 os.fchmod(file.fileno(), mode)
             os.fsync(file.fileno())
+            info = os.fstat(file.fileno())
+            fingerprint = info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size
             os.replace(tmp, path)
             _sync_directory(directory)
+            return fingerprint
         finally:
             try:
                 os.unlink(tmp)
@@ -55,6 +58,7 @@ def write_json(path, data, *, validate=None, indent=None, follow_symlinks=False,
                require_writable=False, allow_nan=False):
     """Replace a JSON file. With a validator, keep its prior valid contents as .bak.
 
+    Return the replaced file fingerprint only after its directory is synced.
     With require_writable, check write access to an existing target without
     truncating or creating it. With allow_nan, retain legacy nonfinite values.
     """
@@ -85,7 +89,7 @@ def write_json(path, data, *, validate=None, indent=None, follow_symlinks=False,
             _replace(backup, previous)
         elif not os.path.exists(backup):
             _replace(backup, content)
-    _replace(path, content, mode=mode)
+    return _replace(path, content, mode=mode)
 
 
 def read_json(path, validate, default):
