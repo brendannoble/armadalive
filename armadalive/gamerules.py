@@ -1,6 +1,6 @@
 """Remembers a power profile and FPS limit for a game, a whole system, every other game (the base rule) or for when no game runs
 (the idle rule), and applies it when that game starts or the last game ends."""
-import json, logging, math, os
+import json, logging, math, os, time
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 from . import emusettings, persistence, nowplaying as esde
 
@@ -41,6 +41,32 @@ def validate_settings(saved):
     return True
 
 
+def _target(spec):
+    return os.path.realpath(spec[0]), spec[1], spec[2]
+
+
+def _read_undo(path):
+    if os.path.islink(path):
+        raise ValueError("emulator recovery file is a symbolic link")
+    try:
+        with open(path) as stream:
+            entries = json.load(stream)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(entries, list):
+        raise ValueError("invalid emulator recovery file")
+    undo = {}
+    for entry in entries:
+        if (not isinstance(entry, list) or len(entry) != 4
+                or not all(isinstance(value, str) for value in entry)
+                or not os.path.isabs(entry[0]) or any("\0" in value for value in entry)
+                or any(char in entry[3] for char in "\r\n")
+                or tuple(entry[:3]) in undo):
+            raise ValueError("invalid emulator recovery entry")
+        undo[tuple(entry[:3])] = entry[3]
+    return undo
+
+
 class GameRules(persistence.OwnerWriter, QObject):
     changed = Signal()
     notice = Signal(str, str)   # saved | removed | loaded | failed, and what it was about
@@ -70,12 +96,21 @@ class GameRules(persistence.OwnerWriter, QObject):
         self._check_deferred = self._restoring = False
         self._applied, self._loaded = "", ""
         self._pending_rule = None
+        self._undo_path = os.path.join(os.path.dirname(CONFIG), "emulator_undo.json")
+        self._undo, self._undo_uncertain = None, False
+        self._launch_key, self._launch_deadline = "", 0
+        self._expired_launch_key = ""
+        self._launch_hold = QTimer(self)
+        self._launch_hold.setSingleShot(True)
+        self._launch_hold.timeout.connect(self._launch_unobserved)
         self._checked = False
         self._scopes = self._current_scopes(nowplaying.state)
         self.history = None      # set by the app: lets a rule show the name of its game, not only the key
         nowplaying.changed.connect(self._check)
         self._identities.changed.connect(self._check)
         self._watch_legacy_rules()
+        if self._prepare_undo():
+            self._restore_emulators(keep=self._running_target())
         system.profileFinished.connect(self._profile_finished)
         gamescope.fpsLimitFinished.connect(self._fps_finished)
         system.profileRequested.connect(self._profile_requested)
@@ -251,23 +286,225 @@ class GameRules(persistence.OwnerWriter, QObject):
         if not self._on:
             self._pending_rule = None
         self._save()
+        if not self._on:
+            self._launch_key = ""
+            self._launch_hold.stop()
+            if self._prepare_undo():
+                running = self._running_target()
+                self._restore_emulators(keep=running)
+                if self._undo and (running == "all" or running in self._undo):
+                    self.notice.emit("resolutionRestorePending", self._np.state.get("title", ""))
+
+    def _write_undo(self, undo):
+        # Replacement/unlink may become visible before directory sync fails.
+        self._undo_uncertain = True
+        if undo:
+            persistence.write_json(self._undo_path, [[*target, original] for target, original in undo.items()])
+        else:
+            persistence.remove(self._undo_path)
+        self._undo, self._undo_uncertain = undo, False
+
+    def _prepare_undo(self):
+        if self._writes_paused or self._base_error or not self._np.processes_known:
+            return False
+        try:
+            if self._undo is None:
+                self._undo = _read_undo(self._undo_path)
+            if self._undo_uncertain:
+                self._write_undo(self._undo)
+            originals, handed_off = {}, set()
+            for system, original in self._base.items():
+                if original is None or system not in emusettings.SPECS:
+                    continue  # Retain device-local values we cannot hand off.
+                if any(char in original for char in "\r\n\0"):
+                    raise ValueError("invalid legacy emulator original")
+                target = _target(emusettings.SPECS[system])
+                if not os.path.isfile(target[0]):
+                    continue  # Its original remains local until the target is available.
+                if target not in self._undo:
+                    if target in originals and originals[target] != original:
+                        raise ValueError("conflicting legacy emulator originals")
+                    originals[target] = original
+                handed_off.add(system)
+            if originals:
+                self._write_undo({**self._undo, **originals})
+            if handed_off:
+                previous = self._base
+                self._base = {key: value for key, value in previous.items() if key not in handed_off}
+                try:
+                    saved = dict(self._saved, enabled=self._on, rules=self._rules, base=self._base)
+                    if not validate_settings(saved):
+                        raise ValueError("invalid game rules")
+                    # Handoff edits each copy's recovery stock without replacing
+                    # the backup's independently useful previous rules.
+                    self._file_version = persistence.write_json(
+                        CONFIG, saved, indent=1, follow_symlinks=True,
+                        require_writable=True, allow_nan=True)
+                    self._retire_legacy_backup()
+                except (OSError, ValueError):
+                    self._base = previous
+                    raise
+            elif self._undo:
+                # Restart after primary handoff but before backup-copy handoff.
+                self._retire_legacy_backup()
+            if self._undo:
+                # A prior handoff replacement may already be visible after a
+                # failed sync. Durability is still required on a no-change retry.
+                persistence._sync_directory(os.path.dirname(os.path.realpath(CONFIG)))
+        except (OSError, ValueError, RecursionError) as error:
+            LOG.warning("Could not prepare emulator recovery: %s", error)
+            return False
+        return True
+
+    def _retire_legacy_backup(self):
+        # The reader falls back beside the lexical path; the validated writer
+        # keeps a copy beside the resolved primary. Preserve each copy's rules.
+        paths = {os.path.realpath(os.fspath(CONFIG) + ".bak"),
+                 os.path.realpath(os.path.realpath(CONFIG) + ".bak")}
+        for path in sorted(paths):
+            try:
+                with open(path) as stream:
+                    saved = json.load(stream)
+            except (FileNotFoundError, ValueError, RecursionError):
+                continue  # An invalid copy cannot be selected by the reader.
+            if not validate_settings(saved):
+                continue
+            previous = saved.get("base", {})
+            remaining = {system: original for system, original in previous.items()
+                         if original is None or system not in emusettings.SPECS
+                         or _target(emusettings.SPECS[system]) not in self._undo}
+            if remaining != previous:
+                persistence.write_json(path, dict(saved, base=remaining), indent=1,
+                                       follow_symlinks=True, require_writable=True, allow_nan=True)
+            persistence._sync_directory(os.path.dirname(path))
+
+    def _running_target(self):
+        cur = self._np.state
+        if cur.get("playing") and cur.get("system") in emusettings.SPECS:
+            return _target(emusettings.SPECS[cur["system"]])
+        if getattr(self._np, "running", False):
+            return "all"  # Steam's overlay can conceal the running emulator.
+        return None
+
+    def _restore_emulators(self, keep=None, *, also_keep=None):
+        if not self._undo or keep == "all":
+            return True
+        supported = {_target(spec) for spec in emusettings.SPECS.values()}
+        protected = {keep, also_keep}
+        remaining = dict(self._undo)
+        for target, original in self._undo.items():
+            if target in protected:
+                continue
+            try:
+                if target not in supported or not emusettings.update_setting((*target, "{}"), lambda _: original):
+                    raise OSError("emulator configuration unavailable")
+                persistence._sync_directory(os.path.dirname(target[0]))
+                del remaining[target]
+            except (OSError, ValueError) as error:
+                LOG.warning("Could not restore emulator resolution: %s", error)
+        if remaining != self._undo:
+            try:
+                self._write_undo(remaining)
+            except (OSError, ValueError) as error:
+                LOG.warning("Could not clear emulator recovery: %s", error)
+        return not self._undo_uncertain and all(target in protected for target in self._undo)
+
+    def _resolution(self, cur):
+        rule = self._rules.get(self._game_key(cur)) or self._rules.get(self._system_key(cur)) or {}
+        return rule.get("res")
+
+    def _resolution_pending(self, cur):
+        pending = self._pending_legacy_rule(cur)
+        if not pending or not self._rules[pending]:
+            return False
+        fallback = self._rules.get(self._system_key(cur), {}).get("res") or 0
+        return (self._rules[pending].get("res") or 0) != fallback
+
+    def prepare_esde_launch(self, system, path, title):
+        """None means pending proof, empty text means ready, other text blocks launch."""
+        if system not in emusettings.SPECS:
+            return ""
+        if self._writes_paused:
+            return "Game rules are paused during backup"
+        cur, _ = esde._esde_selection(dict(event="game-select", system=system, path=path, name=title))
+        if not cur.get("key"):
+            return "Could not identify the selected game"
+        self._identities.describe(cur)
+        if self._on and self._resolution_pending(cur):
+            return None
+        if not self._np.processes_known:
+            # A known no-op needs no process observation. Recovery evidence or a
+            # requested override must wait for the existing essential scanner.
+            needs_change = (self._on and self._resolution(cur)) or self._base or self._undo or os.path.lexists(self._undo_path)
+            return None if needs_change else ""
+        running = self._running_target()
+        if running is not None:
+            if not self._prepare_undo():
+                return "Could not prepare emulator resolution recovery"
+            target = _target(emusettings.SPECS[system])
+            resolution = self._resolution(cur) if self._on else None
+            if resolution and (type(resolution) is not int or not 1 <= resolution <= emusettings.MAX):
+                return "Choose a supported emulator resolution"
+            desired = emusettings.SPECS[system][3].format(resolution) if resolution else None
+            protected = (set(self._undo) | {target}) if running == "all" else ({target} if running == target else set())
+            for active in protected:
+                expected = desired if active == target and desired is not None else self._undo.get(active)
+                if expected is not None and emusettings.read_setting((*active, "{}")) != expected:
+                    return "Close the running game before changing emulator resolution"
+        self._expired_launch_key = ""
+        problem = self._emulator(cur)
+        if not problem and self._on and self._resolution(cur):
+            if self._launch_key != cur["key"]:
+                self._launch_key = cur["key"]
+                self._launch_deadline = time.monotonic() + 25
+                self._launch_hold.start(25000)
+        return problem
+
+    @Slot()
+    def _launch_unobserved(self):
+        self._expired_launch_key = self._launch_key
+        self._launch_key = ""
+        self._launch_hold.stop()
+        if self._writes_paused:
+            self._check_deferred = True
+            return
+        if self._prepare_undo():
+            self._restore_emulators(keep=self._running_target())
 
     def _emulator(self, cur):
-        """Just before a game starts (while it is selected in ES-DE) its emulator gets the saved resolution; a game without one
-        gets back what the emulator had before. shortcut: only the first override remembers the original value."""
-        system = cur.get("system")
-        if self._pending_legacy_rule(cur):
-            return
-        if cur.get("kind") != "game" or cur.get("playing") or system not in emusettings.SPECS:
-            return
-        rule = self._rules.get(self._game_key(cur)) or self._rules.get(self._system_key(cur)) or {}
-        if rule.get("res"):
-            if system not in self._base:
-                self._base[system] = emusettings.read(system)
-            if self._base[system] is not None:
-                emusettings.write(system, rule["res"])
-        elif self._base.get(system) is not None:
-            emusettings.write(system, self._base.pop(system))
+        if self._writes_paused:
+            return "Game rules are paused during backup"
+        running = self._running_target()
+        if running == "all":
+            return ""
+        if not self._prepare_undo():
+            return "Could not prepare emulator resolution recovery"
+        spec = emusettings.SPECS.get(cur.get("system")) if cur.get("kind") == "game" else None
+        resolution = self._resolution(cur) if self._on and spec and not self._resolution_pending(cur) else None
+        target = _target(spec) if spec else None
+        if not self._restore_emulators(keep=running, also_keep=target if resolution else None):
+            return "Could not restore emulator resolution"
+        if target == running or cur.get("playing") or not resolution:
+            return ""
+        # Preserve compatible saved values, but do not send invalid resolutions
+        # to an emulator. No configuration migration is implied by refusal.
+        if type(resolution) is not int or not 1 <= resolution <= emusettings.MAX:
+            return "Choose a supported emulator resolution"
+        value = spec[3].format(resolution)
+
+        def remember(original):
+            if original is None:
+                raise ValueError("emulator resolution option is missing")
+            if original != value and (self._undo_uncertain or target not in self._undo):
+                self._write_undo({target: original, **self._undo})
+            return value
+
+        try:
+            if emusettings.update_setting((*target, spec[3]), remember):
+                return ""
+        except (OSError, ValueError) as error:
+            LOG.warning("Could not apply emulator resolution: %s", error)
+        return "Could not apply emulator resolution"
 
     def _apply(self, rule, label):
         self._pending_rule = None
@@ -346,8 +583,19 @@ class GameRules(persistence.OwnerWriter, QObject):
         if migrated or scopes != self._scopes:
             self._scopes = scopes
             self.changed.emit()
-        if self._on:
-            self._emulator(cur)
+        if self._launch_key and time.monotonic() >= self._launch_deadline:
+            self._launch_unobserved()
+        if self._launch_key and cur.get("playing") and cur.get("key") == self._launch_key:
+            self._launch_key = ""
+            self._launch_hold.stop()
+        if self._expired_launch_key != cur.get("key"):
+            self._expired_launch_key = ""
+        if not self._launch_key:
+            if self._expired_launch_key:
+                if self._prepare_undo():
+                    self._restore_emulators(keep=self._running_target())
+            else:
+                self._emulator(cur)
         if not cur.get("playing"):
             # Steam's own UI in front of a running game is not "no game": only when the process is gone does the idle rule apply
             if self._applied and not getattr(self._np, "running", False):
@@ -364,6 +612,13 @@ class GameRules(persistence.OwnerWriter, QObject):
         if not self._on or not game or self._checked or self._pending_legacy_rule(cur):
             return
         self._checked = True
+        system = cur.get("system")
+        if system in emusettings.SPECS:
+            spec = emusettings.SPECS[system]
+            resolution = self._resolution(cur)
+            expected = spec[3].format(resolution) if resolution else (self._undo or {}).get(_target(spec))
+            if expected is not None and emusettings.read(system) != expected:
+                self.notice.emit("resolutionNextLaunch", cur.get("title") or game)
         for key, label in ((self._game_key(cur), "game"), (self._system_key(cur), "system"), (BASE, "base")):
             if key in self._rules:
                 self._apply(self._rules[key], f"{cur.get('title') or cur.get('key')}" if label == "game" else label)

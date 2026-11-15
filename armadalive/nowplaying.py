@@ -713,6 +713,7 @@ class NowPlaying(QObject):
         self._event, self._steam, self._proc = {}, None, None
         self._ui_focus, self._ui_app, self._hold, self._esde = False, (0, ""), 0.0, False
         self._pinned = False
+        self.processes_known = False  # Initial absence of a snapshot is not observed idle.
         self.running = False     # a game is really running (a process), even while Steam's UI is in front
         self._sgame = None       # the non-Steam shortcut in front, if it is a game of its own
         self._shortcut = False   # a non-Steam shortcut (ES-DE itself, or an emulator it started) is in front
@@ -756,14 +757,18 @@ class NowPlaying(QObject):
         self._update()
 
     def _scan(self, found):
+        first = not self.processes_known
+        self.processes_known = True
         game, esde, steam = found
         moved = game != self._proc or esde != self._esde
         self._proc, self._esde = game, esde
         running = bool(game or steam)
         moved = moved or running != self.running
         self.running = running
-        if moved:
+        if moved or first:
             self._update()
+            if first and self._pinned:
+                self.changed.emit()  # Observation is ready even with pinned presentation.
 
     def _ui_selected(self, appid, name):
         self._ui_app = (appid, name)
