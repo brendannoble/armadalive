@@ -31,6 +31,7 @@ class Folders(unittest.TestCase):
 
     def make(self, rows=()):
         backend = apps.Apps(FakeHistory(list(rows)))
+        self.addCleanup(backend.flush)
         wait_for(lambda: not backend.catalogLoading)
         return backend
 
@@ -45,11 +46,13 @@ class Folders(unittest.TestCase):
         a.renameFolder(fid, "  Tools  ")
         self.assertEqual([i["name"] for i in a.folderItems(fid)], ["Firefox", "Counter-Strike"])
         self.assertEqual(a.slots[0]["name"], "Tools")
+        a.flush()
         again = self.make()                                  # it survives a restart
         self.assertEqual(again.slots[0]["count"], 2)
         a.removeFromFolder(fid, "firefox")
         self.assertEqual(a.slots[0]["count"], 1)
         a.assign(0, "")
+        a.flush()
         self.assertEqual(json.load(open(f"{self.dir}/apps.json"))["folders"], {})
 
     def test_the_favorites_folder_and_a_random_start_inside_a_folder(self):
