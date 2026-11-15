@@ -1,7 +1,8 @@
 import os, struct, tempfile, unittest
 from unittest import mock
 
-from tests.common import app, touch  # noqa: F401
+from tests.common import touch, wait_for
+from tests.test_app_catalog import catalog_fixture
 from PySide6.QtGui import QColor, QImage
 
 from armadalive import apps, steamlib
@@ -44,15 +45,54 @@ class Library(unittest.TestCase):
         self.assertEqual(img.pixelColor(0, 0).alpha(), 0)          # corner is cut away
         self.assertGreater(img.pixelColor(180, 180).red(), 240)     # middle is the cover
 
+    def test_title_only_scan_skips_artwork(self):
+        with mock.patch.object(steamlib, "_installed_art") as installed, \
+                mock.patch.object(steamlib, "_shortcut_art") as shortcuts:
+            games = steamlib.games(art=False)
+        installed.assert_not_called()
+        shortcuts.assert_not_called()
+        self.assertEqual({game["name"] for game in games}, {"Counter-Strike", "Eglantine"})
+        self.assertTrue(all(not game["icon"] for game in games))
+
+    def test_linked_game_artwork_is_indexed_for_each_game(self):
+        cache = f"{self.root}/appcache/librarycache"
+        target = f"{self.root}/shared-artwork"
+        touch(f"{target}/library_600x900.jpg")
+        for appid in ("11", "12"):
+            os.symlink(target, f"{cache}/{appid}")
+        covers = steamlib._installed_art(cache)
+        self.assertEqual(covers.get("11"), f"{cache}/11/library_600x900.jpg")
+        self.assertEqual(covers.get("12"), f"{cache}/12/library_600x900.jpg")
+
+    def test_artwork_directory_cycle_is_pruned_before_relisting(self):
+        cache = f"{self.root}/appcache/librarycache"
+        touch(f"{cache}/10/nested/header.jpg")
+        os.symlink(f"{cache}/10", f"{cache}/10/nested/ancestor")
+        real_scandir = os.scandir
+        visited = []
+
+        def bounded_scandir(path):
+            visited.append(path)
+            if len(visited) > 4:
+                raise AssertionError("artwork traversal followed a directory cycle")
+            return real_scandir(path)
+
+        with mock.patch.object(os, "scandir", bounded_scandir):
+            covers = steamlib._installed_art(cache)
+        self.assertEqual(covers["10"], f"{cache}/10/library_600x900.jpg")
+        self.assertEqual(len(visited), 3)
+
     def test_grid_adds_replaces_and_removes_and_only_knows_catalog_ids(self):
-        with mock.patch.object(apps, "CONFIG", f"{self.root}/apps.json"), mock.patch.object(apps, "_catalog", lambda: {}):
-            a = apps.Apps()
+        with mock.patch.object(apps, "CONFIG", f"{self.root}/apps.json"), \
+                mock.patch.object(apps, "_catalog", lambda: {}), catalog_fixture() as a:
+            wait_for(lambda: not a.catalogLoading)
             self.assertEqual(a.slots, [{}])
             a.assign(0, "steam:10")
             a.assign(5, "steam:10")
             a.assign(0, "nonsense")
             self.assertEqual([s.get("id") for s in a.slots], ["steam:10", None])
             a.assign(0, "")
+            a.flush()
             self.assertEqual(a.slots, [{}])
 
 

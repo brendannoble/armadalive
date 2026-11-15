@@ -40,10 +40,32 @@ Window {
     // the screen dims a little after 10 s without a touch; the next touch wakes it (and does nothing else)
     property bool dimmed: false
     property bool blanked: false        // screen off: true black, ignores touches, a long press or the AYN button wakes it
+    readonly property bool presentationActive: visible && visibility !== Window.Hidden && visibility !== Window.Minimized && !blanked
     property bool pressWasBlanked: false
     property bool pressWasFront: false
     property string askDemo: ""     // snapshots only: open the password dialog
     onAskDemoChanged: Auth.ask = askDemo
+    property bool passwordOpen: false
+    property Item passwordReturnFocus: null
+    readonly property bool pageInteractive: !blanked && !passwordOpen && !onboardingOverlay.visible && !closer.state.phase
+    function syncPassword() {
+        const opening = Auth.ask !== ""
+        if (opening === passwordOpen) return
+        if (opening) {
+            passwordReturnFocus = activeFocusItem
+            passwordOpen = true
+        } else {
+            passwordOpen = false
+            const previous = passwordReturnFocus
+            passwordReturnFocus = null
+            if (previous && previous.visible && previous.enabled)
+                previous.forceActiveFocus()
+            else
+                contentItem.forceActiveFocus()
+            if (home && peek && !nav.activeFocus) hideChrome.restart()
+        }
+    }
+    Connections { target: Auth; function onAskChanged() { win.syncPassword() } }
     readonly property bool dimEnabled: ui.state.dim !== false     // Settings > Dim after 10 s
     function wake() { dimmed = false; if (dimEnabled) idle.restart() }
     onDimEnabledChanged: { if (dimEnabled) idle.restart(); else { idle.stop(); dimmed = false } }
@@ -68,7 +90,7 @@ Window {
     // whatever un-fullscreens the window (another app, Plasma, a resize) is undone at once; Plasma's swipe-up panels draw over it
     onVisibilityChanged: if (win.visible && win.visibility !== Window.FullScreen && win.visibility !== Window.Hidden && win.visibility !== Window.Minimized) Qt.callLater(applyVisibility)
     onActiveChanged: if (active) applyVisibility()
-    Timer { interval: 3000; running: win.visible; repeat: true; onTriggered: if (win.visibility === Window.Windowed || win.visibility === Window.Maximized) win.applyVisibility() }
+    Timer { interval: 3000; running: win.presentationActive; repeat: true; onTriggered: if (win.visibility === Window.Windowed || win.visibility === Window.Maximized) win.applyVisibility() }
     function go(id) { page = id; if (home) hideChrome.restart() }
     function step(delta) {
         const i = pages.findIndex(p => p.id === section), j = i + delta
@@ -77,13 +99,18 @@ Window {
     onCurrentChanged: if (current.id !== page) page = current.id
     onHomeChanged: if (home) { peek = true; hideChrome.restart() }
     // "Follow game" takes its colour from the artwork the top screen is showing; without artwork it falls back to its plain palette
-    readonly property string followColor: ui.state.theme === "follow" ? artwork.dominant(now.fanart || now.logo || "") : ""
+    readonly property bool followActive: presentationActive && ui.state.theme === "follow"
+    readonly property string followSource: ui.state.theme === "follow" ? now.fanart || now.logo || "" : ""
+    readonly property string followColor: artwork.color
+    function requestFollowColor() { artwork.request(followSource, followActive) }
+    onFollowSourceChanged: requestFollowColor()
+    onFollowActiveChanged: requestFollowColor()
     function applyTheme() {
         Theme.apply(ui.state.theme, ui.state.theme === "follow" ? followColor : ui.state.accent)
         ui.applyFont(Theme.fontFamily)
     }
     onFollowColorChanged: applyTheme()
-    Component.onCompleted: { if (dimEnabled) idle.start(); applyVisibility(); applyTheme(); Tr.lang = ui.state.lang; ledSync.start(); activity.watch(win) }
+    Component.onCompleted: { if (dimEnabled) idle.start(); applyVisibility(); requestFollowColor(); applyTheme(); Tr.lang = ui.state.lang; ledSync.start(); activity.watch(win); syncPassword() }
     // The stick LEDs follow the theme's accent, until the user picks a colour of their own (Stick LEDs tile on System). Only while the LEDs are on and the
     // root helper can set them; a moment after the last change, because the accent fades and "Follow game" changes it with every game.
     function accentHex() { const c = Theme.accent; return [c.r, c.g, c.b].map(x => ("0" + Math.round(x * 255).toString(16)).slice(-2)).join("").toUpperCase() }
@@ -161,15 +188,32 @@ Window {
         interval: 900
         onTriggered: console.info("AYN: platform=" + Qt.platform.pluginName + " visible=" + win.visible + " active=" + win.active + " kwin=" + shell.hasKwin())
     }
-    Timer { id: hideChrome; interval: 3000; onTriggered: win.peek = false }
+    Timer {
+        id: hideChrome
+        interval: 3000
+        onTriggered: if (!nav.activeFocus && !win.passwordOpen) win.peek = false
+    }
+    Shortcut {
+        sequences: ["Tab", "Shift+Tab"]
+        autoRepeat: false
+        enabled: win.pageInteractive && !win.chrome
+        onActivated: {
+            nav.focusWhenShown = true
+            win.peek = true
+            hideChrome.restart()
+        }
+    }
 
     Item {
         id: body
+        enabled: win.pageInteractive
         anchors { left: parent.left; right: parent.right; top: win.home ? parent.top : status.bottom; bottom: win.home ? parent.bottom : (mediaBar.visible ? mediaBar.top : nav.top) }
         clip: true
         Loader {
             anchors { fill: parent; leftMargin: win.home ? 0 : 12 * win.u; rightMargin: win.home ? 0 : 12 * win.u; topMargin: win.home ? 0 : 6 * win.u; bottomMargin: win.home ? 0 : 6 * win.u }
             source: win.current.file
+            onLoaded: if ("presentationActive" in item)
+                item.presentationActive = Qt.binding(() => win.presentationActive)
         }
         // swipe sideways between pages; the PDF view keeps its own panning
         DragHandler {
@@ -245,18 +289,32 @@ Window {
         }
     }
 
-    Rectangle {
+    FocusScope {
         id: nav
+        property bool focusWhenShown: false
+        enabled: win.pageInteractive && win.chrome && y + height <= parent.height
+        onEnabledChanged: {
+            if (!enabled || !focusWhenShown) return
+            focusWhenShown = false
+            const index = win.pages.findIndex(p => p.id === win.section)
+            const button = navButtons.itemAt(Math.max(0, index))
+            if (button) button.forceActiveFocus(Qt.TabFocusReason)
+        }
+        onActiveFocusChanged: if (!activeFocus && win.pageInteractive && win.home && win.peek) hideChrome.restart()
         x: 18 * win.u
         width: parent.width - 36 * win.u
         height: 92 * win.u
         y: win.chrome ? parent.height - height - 16 * win.u : parent.height + 4
         Behavior on y { NumberAnimation { duration: Theme.dur(180); easing.type: Theme.ease } }
-        radius: Theme.radius * win.u
-        color: Theme.card
+        Rectangle {
+            anchors.fill: parent
+            radius: Theme.radius * win.u
+            color: Theme.card
+        }
         Row {
             anchors.fill: parent
             Repeater {
+                id: navButtons
                 model: win.pages
                 delegate: CircleButton {
                     width: nav.width / win.pages.length
@@ -274,6 +332,7 @@ Window {
     // what plays on the main screen (music, video): shown with the other bars, on the game page over the artwork
     Rectangle {
         id: mediaBar
+        enabled: win.pageInteractive
         x: 18 * win.u
         width: parent.width - 36 * win.u
         height: 46 * win.u
@@ -305,8 +364,15 @@ Window {
         function onNotice(code, detail) {
             const text = ({ tson: Tr.t("Tailscale connected"), tsoff: Tr.t("Tailscale off"), tslogin: Tr.t("Tailscale needs a login"),
                             tsmissing: Tr.t("Tailscale is not running"), tsfail: Tr.t("Tailscale did not switch"),
-                            tsdenied: Tr.t("Run once: sudo tailscale set --operator=armada") })[code]
+                            tsdenied: Tr.t("Run once: sudo tailscale set --operator=armada"),
+                            commandfail: Tr.t("Setting could not be changed") })[code]
             toast.show(text, code !== "tson" && code !== "tsoff")
+        }
+    }
+    Connections {
+        target: apps
+        function onSaveFailed(detail) {
+            toast.show(Tr.t("App layout could not be saved") + (detail ? ": " + detail : ""), true)
         }
     }
     // short messages from the app: something was done (accent colour) or went wrong (red)
@@ -314,16 +380,24 @@ Window {
         target: steamShortcuts
         function onNotice(code, title) {
             const text = ({ created: Tr.t("Shortcut created"), exists: Tr.t("Already in Steam"), unknown: Tr.t("Launch the game from ES-DE once first"),
-                            unreachable: Tr.t("Steam is not reachable") })[code]
-            toast.show(title && code !== "unknown" ? text + ": " + title : text, code !== "created")
+                            unreachable: Tr.t("Steam could not complete the shortcut"),
+                            prepareFailed: Tr.t("Could not prepare the Steam shortcut"),
+                            launchUnavailable: Tr.t("No launch command is available"),
+                            launchFailed: Tr.t("Steam could not start the game"),
+                            launchBlocked: Tr.t("Launch blocked"),
+                            launchRequested: Tr.t("Launch requested") })[code]
+            toast.show(title && code !== "unknown" ? text + ": " + title : text,
+                       code !== "created" && code !== "launchRequested")
         }
     }
     // saving, removing and loading a game rule
     Connections {
         target: rules
         function onNotice(code, detail) {
-            const text = ({ saved: Tr.t("Rule saved"), removed: Tr.t("Rule removed"), loaded: Tr.t("Rule loaded") })[code]
-            toast.show(text + ": " + detail, false)
+            const text = ({ saved: Tr.t("Rule saved"), removed: Tr.t("Rule removed"), loaded: Tr.t("Rule loaded"),
+                            resolutionNextLaunch: Tr.t("Resolution rule applies on the next launch"),
+                            failed: Tr.t("Rule failed") })[code]
+            toast.show(text + ": " + detail, code === "failed")
         }
     }
     Rectangle {
@@ -391,6 +465,7 @@ Window {
     onTuningChanged: if (tuning.active) wake()
     Rectangle {
         id: keep
+        enabled: win.pageInteractive && win.tuning.active === true
         anchors.horizontalCenter: parent.horizontalCenter
         y: 10 * win.u
         width: Math.min(parent.width - 30 * win.u, 520 * win.u)
@@ -409,16 +484,28 @@ Window {
             width: parent.width - 28 * win.u
             spacing: 8 * win.u
             Text { width: parent.width; color: Theme.text; font.pixelSize: 16 * win.u; wrapMode: Text.WordWrap
-                   text: Tr.t("Keep this setting?") + "  ·  " + Tr.t("back to the old one in") + " " + win.tuning.seconds + " s" }
+                   text: win.tuning.recovery
+                         ? Tr.t(win.tuning.busy ? "Restoring previous tuning settings…" : "Previous tuning settings still need to be restored.")
+                         : Tr.t("Keep this setting?") + "  ·  " + Tr.t("back to the old one in") + " " + win.tuning.seconds + " s" }
             Rectangle {
+                visible: !win.tuning.recovery
                 width: parent.width; height: 6 * win.u; radius: height / 2; color: Theme.circle
                 Rectangle { width: parent.width * win.tuning.seconds / Math.max(1, win.tuning.total); height: parent.height; radius: height / 2; color: Theme.warm
                             Behavior on width { NumberAnimation { duration: 900 } } }
             }
             Row {
                 spacing: 10 * win.u
-                PillButton { primary: true; label: Tr.t("Keep"); onClicked: settings.confirm() }
-                PillButton { label: Tr.t("Undo"); onClicked: settings.revert() }
+                PillButton {
+                    primary: true; label: Tr.t("Keep")
+                    visible: !win.tuning.recovery
+                    enabled: !win.tuning.busy && win.tuning.seconds > 0
+                    onClicked: settings.confirm()
+                }
+                PillButton {
+                    label: Tr.t(win.tuning.recovery ? "Retry restore" : "Undo")
+                    enabled: !win.tuning.busy
+                    onClicked: settings.revert()
+                }
             }
         }
     }
@@ -449,14 +536,17 @@ Window {
     }
 
     Onboarding {
+        id: onboardingOverlay
         objectName: "onboarding"
         anchors.fill: parent
         visible: ui.state.onboarded === false
+        enabled: !win.blanked && !win.passwordOpen
     }
 
     PasswordDialog {
         anchors.fill: parent
-        visible: Auth.ask !== ""
+        visible: win.passwordOpen
+        enabled: !win.blanked
         action: Auth.ask
         onCancelled: Auth.ask = ""
         onAccepted: password => { admin.run(Auth.ask, password); Auth.ask = "" }

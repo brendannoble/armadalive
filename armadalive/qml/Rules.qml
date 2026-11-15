@@ -4,6 +4,7 @@ import QtQuick
 // Reached from the Rules tile on System. The list names each game, not only its Steam id.
 Flickable {
     id: page
+    enabled: !rl.writesPaused
     readonly property var rl: rules.state
     readonly property var s: nowPlaying.state
     readonly property bool inGame: s.kind === "game"

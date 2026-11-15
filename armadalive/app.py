@@ -1,6 +1,6 @@
-import json, os, signal, sys
+import json, os, signal, sys, time
 from PySide6.QtCore import QObject, QPoint, QTimer, QUrl, Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QWindow
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickWindow
 from PySide6.QtTest import QTest
@@ -8,11 +8,12 @@ from PySide6.QtTest import QTest
 from . import __version__
 from .admin import Admin
 from .apps import Apps
+from .artwork import VectorArtwork
 from .gameinfo import GameInfo
 from .history import History
 from . import steamlib
 from .ayn import AynButton
-from .backup import Backup
+from .backup import Backup, RestoreRecoveryError, recover_restore
 from .battery import Battery
 from .closer import Closer
 from .gamepad import Pad
@@ -45,22 +46,50 @@ from .emulator_control import EmulatorControl
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def install_signal_handlers(app, ayn):
+    """Schedule signal-driven exits through the running Qt event loop."""
+    def request_exit(signum, _frame):
+        # The launcher treats SIGTERM as a failure so it can restart under Plasma.
+        QTimer.singleShot(0, lambda: app.exit(128 + signum))
+
+    signal.signal(signal.SIGTERM, request_exit)
+    signal.signal(signal.SIGINT, request_exit)
+    # The app-drawer launcher sends SIGUSR1. SIGUSR2 simulates a whole button tap.
+    signal.signal(signal.SIGUSR1, lambda *_: ayn.pressed.emit())
+    signal.signal(signal.SIGUSR2, lambda *_: (ayn.pressed.emit(), ayn.released.emit()))
+    wake = QTimer(app)
+    wake.timeout.connect(lambda: None)  # Let Python process signals while Qt is idle.
+    wake.start(250)
+
+
 def main():
+    try:
+        recover_restore()
+    except RestoreRecoveryError as error:
+        print(error, file=sys.stderr)
+        return 1
     app = QGuiApplication(sys.argv)
     app.setApplicationName("ArmadaLive")
     app.setApplicationVersion(__version__)
     app.setDesktopFileName("armadalive")
     engine = QQmlApplicationEngine()
+    engine.addImageProvider("vectors", VectorArtwork())
     # the context does not own these objects: keep them referenced for the life of the app
     gamescope, steamui = Gamescope(), SteamUi()
     now, monitor = NowPlaying(gamescope, steamui), SystemMonitor(fps=lambda: gamescope.state["fps"])
     layout = ControlsLayout()
     emulator_ctrl = EmulatorControl()
-    history = History(now, steam_titles=lambda: {g["id"]: g["name"] for g in steamlib.games()})
+    history = History(now, steam_titles=lambda: {g["id"]: g["name"] for g in steamlib.games(art=False)})
     now.history = history
-    backends = dict(steamui=steamui, gamescope=gamescope, nowPlaying=now, system=monitor, ayn=AynButton(), settings=Settings(), apps=Apps(history), history=history, gameinfo=GameInfo(history), shell=Shell(), controls=Controls(), ui=UiSettings(), updater=Updater(), admin=Admin(),
-                    health=Health(steamui), rules=GameRules(now, gamescope, monitor), tileStore=Tiles(),
-                    battery=Battery(), media=Media(), backup=Backup(), artwork=Palette(), steamShortcuts=SteamShortcuts(now), tasks=Tasks(), onboarding=Onboarding(), activity=Activity(), manuals=Manuals(), ludo=LudoSync(), trackpad=Trackpad(), cheats=Cheats(), layout=layout, emulatorControl=emulator_ctrl)
+    rules = GameRules(now, gamescope, monitor)
+    shortcuts = SteamShortcuts(now, prepare_esde_launch=getattr(rules, "prepare_esde_launch", None))
+    legacy_rules_changed = getattr(now, "legacyRulesChanged", None)
+    if legacy_rules_changed is not None:
+        legacy_rules_changed.connect(shortcuts.resume_esde_launch)
+    app_catalog = Apps(history, shortcuts)
+    backends = dict(steamui=steamui, gamescope=gamescope, nowPlaying=now, system=monitor, ayn=AynButton(), settings=Settings(), apps=app_catalog, history=history, gameinfo=GameInfo(history), shell=Shell(), controls=Controls(), ui=UiSettings(), updater=Updater(), admin=Admin(),
+                    health=Health(steamui), rules=rules, tileStore=Tiles(),
+                    battery=Battery(), media=Media(), backup=Backup(writers=(app_catalog, history, rules)), artwork=Palette(), steamShortcuts=shortcuts, tasks=Tasks(), onboarding=Onboarding(), activity=Activity(), manuals=Manuals(), ludo=LudoSync(), trackpad=Trackpad(), cheats=Cheats(), layout=layout, emulatorControl=emulator_ctrl)
     pad = backends["pad"] = Pad()   # must stay referenced, like the rest
     backends["closer"] = Closer(pad, gamescope, now, backends["ui"])
     backends["thermal"] = Thermal(monitor, backends["ui"])
@@ -69,20 +98,25 @@ def main():
         engine.rootContext().setContextProperty(name, obj)
     # closing the window only hides it: the app keeps listening for the AYN button and can bring itself back
     app.setQuitOnLastWindowClosed(False)
-    # SIGUSR1 does what the AYN button does (used by the app-drawer launcher)
-    signal.signal(signal.SIGUSR1, lambda *_: backends["ayn"].pressed.emit())
-    # SIGUSR2 is a whole tap of it (press and release), which toggles; here so the toggle can be tried without the button
-    signal.signal(signal.SIGUSR2, lambda *_: (backends["ayn"].pressed.emit(), backends["ayn"].released.emit()))
-    wake = QTimer()
-    wake.timeout.connect(lambda: None)  # keeps the interpreter running so it notices the signal
-    wake.start(250)
+    install_signal_handlers(app, backends["ayn"])
     engine.load(QUrl.fromLocalFile(HERE + "/qml/Main.qml"))
     if not engine.rootObjects():
         return 1
+    window = engine.rootObjects()[0]
+    presentation = (monitor, gamescope, backends["admin"], backends["controls"], backends["health"], backends["media"])
+
+    def update_presentation(*_):
+        active = window.isVisible() and window.visibility() != QWindow.Visibility.Minimized and not window.property("blanked")
+        for backend in presentation:
+            backend.set_active(active)
+
+    window.visibleChanged.connect(update_presentation)
+    window.visibilityChanged.connect(update_presentation)
+    window.blankedChanged.connect(update_presentation)
+    update_presentation()
     if "--snapshot" in sys.argv:  # render the first frames to a PNG and exit, for docs and tests
         out = sys.argv[sys.argv.index("--snapshot") + 1]
         page = int(sys.argv[sys.argv.index("--page") + 1]) if "--page" in sys.argv else 0
-        window = engine.rootObjects()[0]
         # a snapshot always shows a fixed game state, otherwise whatever ES-DE or Steam is doing at that moment throws the page
         # back to "Game": {"event": {...}} like ES-DE sends, or {"ui": [appid, "name"]} for Steam's UI; none means idle
         demo = json.loads(sys.argv[sys.argv.index("--demo") + 1]) if "--demo" in sys.argv else {}
@@ -113,8 +147,8 @@ def main():
             QTimer.singleShot(int(ms), lambda: backends["nowPlaying"].pin(json.loads(later).get("event"), json.loads(later).get("ui")))
         if "--keep-demo" in sys.argv:  # show the keep-or-undo bar with 11 s left (nothing is changed or reverted)
             st = backends["settings"]
-            st._undo, st._left = {("profile", "demo", "demo"): "x"}, 11
-            st.changed.emit()
+            st._undo, st._deadline = {("profile", "demo", "demo"): "x"}, time.monotonic() + 11
+            st.pendingChanged.emit()
         if "--ask" in sys.argv:
             window.setProperty("askDemo", sys.argv[sys.argv.index("--ask") + 1])
         if "--notice" in sys.argv:  # code:title, show that popup message 600 ms in

@@ -1,5 +1,5 @@
 """Manage and activate cheats for RetroArch games."""
-import os, re
+import os
 from PySide6.QtCore import Property, QObject, Signal, Slot
 
 CONFIG = os.path.expanduser("~/.config/retroarch")
@@ -24,32 +24,43 @@ class Cheats(QObject):
         self._write_config(game_key)
         self.changed.emit()
 
+    @Property("QVariantMap", notify=changed)
+    def active(self):
+        return {key: sorted(indices) for key, indices in self._active.items() if indices}
+
+    @Slot(str, int, result=bool)
     def is_active(self, game_key, cheat_index):
         """Check if a cheat is active."""
         return cheat_index in self._active.get(game_key, set())
 
     def _write_config(self, game_key):
         """Write active cheats to RetroArch's .opt config file for a game."""
-        # game_key format: "system/gamename" for emulated, "steam/appid" for Steam
-        if not game_key.startswith("snes/") and not game_key.startswith("nes/") and \
-           not game_key.startswith("genesis/") and not game_key.startswith("n64/"):
-            return  # only write for emulated games, not Steam
+        # The app's canonical key retains the ROM's relative path and extension.
+        # RetroArch core options still use only the ROM's filename stem.
+        system, separator, relative = game_key.removeprefix("esde:").partition("/")
+        if not separator or system not in ("snes", "nes", "genesis", "n64"):
+            return
+        rom_name = os.path.basename(relative)
+        if game_key.startswith("esde:"):
+            rom_name = os.path.splitext(rom_name)[0]
+        if not rom_name or rom_name in (".", ".."):
+            return
 
-        system = game_key.split("/")[0]
         # assume RetroArch core names match system (snes -> Snes9x, etc)
         # this is a simplification; real mapping would be more complex
         core_name = {"snes": "Snes9x", "nes": "Nestopia", "genesis": "Genesis-Plus-GX"}.get(system, system)
 
-        opt_file = os.path.join(CONFIG, "config", core_name, game_key.split("/")[1] + ".opt")
+        opt_file = os.path.join(CONFIG, "config", core_name, rom_name + ".opt")
         os.makedirs(os.path.dirname(opt_file), exist_ok=True)
 
         # read existing opt file if it exists
         opts = {}
         if os.path.exists(opt_file):
-            for line in open(opt_file):
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    opts[k.strip()] = v.strip()
+            with open(opt_file) as config:
+                for line in config:
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        opts[k.strip()] = v.strip()
 
         # set cheat enables
         opts["cheats_enabled"] = '"true"'

@@ -2,14 +2,21 @@
 
 It follows NowPlaying: a game that runs starts a session, anything else ends it. Steam's own play times and ES-DE's `lastplayed` are read once, so the lists are
 not empty on the first day. Kept in ~/.config/armadalive/history.json; sessions older than a year are dropped."""
-import glob, json, os, re, time
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
-from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
+import glob, logging, os, re, threading, time
+from concurrent.futures import Future, wait
 
+from copy import deepcopy
+from datetime import datetime, timedelta
+from PySide6.QtCore import Property, QCoreApplication, QObject, QTimer, Signal, Slot
+
+from . import nowplaying as esde
+from . import persistence
+
+LOG = logging.getLogger(__name__)
 CONFIG = os.path.expanduser("~/.config/armadalive/history.json")
 MIN_SESSION = 10          # seconds: a game that was started by mistake and closed again is not a play
 KEEP_DAYS = 400
+SHUTDOWN_TIMEOUT = 3.0
 STEAM = os.path.expanduser("~/.local/share/Steam")
 
 
@@ -30,19 +37,87 @@ def _read_steam():
 
 
 def _read_esde(gamelists):
-    """[(system, file name, lastplayed epoch, playcount)] for every game ES-DE has a `lastplayed` for."""
+    """Canonical game identity and play counts from ES-DE's dated gamelist entries."""
+    root, definitions = esde._rom_configuration()
     out = []
-    for f in glob.glob(os.path.join(gamelists, "*", "gamelist.xml")):
+    for f in glob.glob(glob.escape(gamelists) + "/*/gamelist.xml"):
         system = os.path.basename(os.path.dirname(f))
-        try:
-            for g in ET.parse(f).getroot().iter("game"):
-                stamp = g.findtext("lastplayed") or ""
-                if stamp:
-                    when = datetime.strptime(stamp[:15], "%Y%m%dT%H%M%S").timestamp()
-                    out.append((system, os.path.basename(g.findtext("path") or ""), when, int(g.findtext("playcount") or 0)))
-        except (OSError, ET.ParseError, ValueError):
-            continue
+        folder = esde._system_folder(system, root, definitions.get(system))
+        entries, _ = esde._gamelist(system, folder, gamelists)
+        for relative, game in entries.items():
+            stamp = game.findtext("lastplayed") or ""
+            if not stamp:
+                continue
+            try:
+                when = datetime.strptime(stamp[:15], "%Y%m%dT%H%M%S").timestamp()
+                plays = int(game.findtext("playcount") or 0)
+            except ValueError:
+                continue
+            title = game.findtext("name") or os.path.splitext(os.path.basename(relative))[0]
+            out.append((esde.rom_key(system, relative), title, system, os.path.join(folder, relative), when, plays))
     return out
+
+
+def _number(value):
+    return type(value) in (int, float) and -(2**63) <= value < 2**63
+
+
+def _valid_game(record):
+    return (isinstance(record, dict)
+            and all(_number(record.get(field, 0)) for field in ("total", "plays", "last"))
+            and all(isinstance(record.get(field, ""), str) for field in ("title", "system", "path", "art"))
+            and isinstance(record.get("favorite", False), bool))
+
+
+def _valid_history(saved):
+    if not isinstance(saved, dict):
+        return False
+    games, sessions = saved.get("games", {}), saved.get("sessions", [])
+    baseline = saved.get("steam_baseline", {})
+    return (isinstance(saved.get("imported", False), bool)
+            and isinstance(games, dict) and isinstance(sessions, list)
+            and isinstance(baseline, dict)
+            and all(isinstance(v, (list, tuple)) and len(v) == 2
+                    and all(_number(n) and n >= 0 for n in v) for v in baseline.values())
+            and all(_valid_game(rec) for rec in games.values())
+            and all(isinstance(s, list) and len(s) == 3 and isinstance(s[0], str)
+                    and _number(s[1]) and 0 <= s[1] < 253402214400
+                    and _number(s[2]) for s in sessions))
+
+
+def _steam_baseline(totals):
+    # Legacy unfinished imports have no checkpoint. Their overlap with Steam
+    # is unknown, so retain the larger known total instead of adding both.
+    try:
+        steam = _read_steam()
+    except (OSError, ValueError) as exc:
+        LOG.warning("Could not read Steam play history: %s", exc)
+        steam = {}
+    return {appid: (last, max(0, seconds - totals.get(f"steam/{appid}", 0)))
+            for appid, (last, seconds) in steam.items()}
+
+
+def _import_history(steam_titles, gamelists, imported, baseline, legacy_keys=()):
+    steam = {} if imported else baseline.result()
+    titles = steam_titles() if steam_titles is not None else {}
+    esde_rows = [] if imported else _read_esde(gamelists)
+    return titles, steam, esde_rows, esde.resolve_legacy_keys(legacy_keys, gamelists)
+
+
+def _background(task, *args, **kwargs):
+    result = Future()
+
+    def run():
+        try:
+            value = task(*args, **kwargs)
+        except Exception as error:
+            result.set_exception(error)
+        else:
+            result.set_result(value)
+
+    # An unresponsive storage device must not prevent the process from exiting.
+    threading.Thread(target=run, daemon=True).start()
+    return result
 
 
 class History(QObject):
@@ -53,19 +128,43 @@ class History(QObject):
         self._path = path or CONFIG
         self._np = nowplaying
         self._games, self._sessions, self._open = {}, [], None      # _open: [key, start epoch, seconds counted so far, monotonic of the last count]
-        self._steam_titles = steam_titles or (lambda: {})
-        try:
-            with open(self._path) as f:
-                saved = json.load(f)
-            self._games, self._sessions = dict(saved.get("games", {})), list(saved.get("sessions", []))
-            imported = bool(saved.get("imported"))
-        except (OSError, ValueError, AttributeError):
-            imported = False
+        self._titles = {}
+        saved = persistence.read_json(self._path, _valid_history, {})
+        self._games, self._sessions = saved.get("games", {}), saved.get("sessions", [])
+        self._write_job = self._pending_save = None
+        self._dirty = False
+        self._waiting_baseline = self._baseline_error = None
+        self._writes_paused = self._deferred_save = False
+        self._write_timer = QTimer(self)
+        self._write_timer.setInterval(30)
+        self._write_timer.timeout.connect(self._finish_save)
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._shutdown)
+        self._imported = bool(saved.get("imported"))
+        self._tracking_ready = self._imported
         cut = time.time() - KEEP_DAYS * 86400
         self._sessions = [s for s in self._sessions if isinstance(s, list) and len(s) == 3 and s[1] >= cut]
-        if not imported:
-            self._import(gamelists)
-            self._save(imported=True)
+        legacy_keys = tuple(key for key in self._games if esde.legacy_key_parts(key))
+        if not self._imported or steam_titles is not None or legacy_keys:
+            baseline = self._baseline_job = Future()
+            if self._imported or "steam_baseline" in saved:
+                baseline.set_result(saved.get("steam_baseline", {}))
+            totals = {} if baseline.done() else {key: rec.get("total", 0) for key, rec in self._games.items()}
+            imported = self._imported
+
+            def load_sources():
+                if not baseline.done():
+                    try:
+                        baseline.set_result(_steam_baseline(totals))
+                    except Exception as error:
+                        baseline.set_exception(error)
+                return _import_history(steam_titles, gamelists or esde.GAMELISTS, imported, baseline, legacy_keys)
+
+            self._import_job = _background(load_sources)
+            self._import_timer = QTimer(self)
+            self._import_timer.timeout.connect(self._finish_import)
+            self._import_timer.start(30)
         nowplaying.changed.connect(self._seen)
         timer = QTimer(self)
         timer.timeout.connect(self._tick)
@@ -73,41 +172,227 @@ class History(QObject):
         self._seen()
 
     # --- reading what the other programs know ---
-    def _import(self, gamelists):
-        titles = self._steam_titles()
-        for appid, (last, seconds) in _read_steam().items():
-            key = f"steam/{appid}"
-            if f"steam:{appid}" in titles:      # installed games and shortcuts only: the account has hundreds of owned ones
-                self._games[key] = dict(title=titles[f"steam:{appid}"], system="steam", path="", total=seconds, plays=1, last=last)
-        from .nowplaying import GAMELISTS
-        for system, name, when, plays in _read_esde(gamelists or GAMELISTS):
-            key = f"{system}/{os.path.splitext(name)[0]}"
-            rec = self._games.setdefault(key, dict(title=os.path.splitext(name)[0], system=system, path="", total=0, plays=0))
-            rec["last"], rec["plays"] = max(rec.get("last", 0), when), max(rec.get("plays", 0), plays)
+    @Slot()
+    def _finish_import(self):
+        if not self._tracking_ready:
+            self._seen()
+        baseline_ready = self._baseline_job.done() and not self._baseline_failed()
+        if self._waiting_baseline is not None and baseline_ready:
+            self._queue_waiting_baseline()
+        if not self._import_job.done():
+            return
+        self._import_timer.stop()
+        try:
+            self._titles, steam, esde_rows, aliases = self._import_job.result()
+        except Exception as exc:
+            if not self._baseline_job.done() or not self._baseline_failed():
+                LOG.warning("Could not import play history: %s", exc)
+            return
+        migrated = self._migrate_legacy(aliases)
+        if not self._imported:
+            for appid, (last, seconds) in steam.items():
+                title = self._titles.get(f"steam:{appid}")
+                if title:  # Installed games and shortcuts only.
+                    rec = self._games.setdefault(f"steam/{appid}", dict(title=title, system="steam", path=""))
+                    rec["total"] = rec.get("total", 0) + seconds
+                    rec["plays"] = rec.get("plays", 0) + 1
+                    rec["last"] = max(rec.get("last", 0), last)
+            for key, title, system, path, when, plays in esde_rows:
+                rec = self._games.setdefault(key, dict(title=title, system=system, path=path, total=0, plays=0))
+                rec["last"], rec["plays"] = max(rec.get("last", 0), when), max(rec.get("plays", 0), plays)
+            self._imported = True
+            self._save()
+        elif migrated:
+            self._save()
+        self.changed.emit()
 
-    def _save(self, imported=True):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w") as f:
-            json.dump(dict(imported=imported, games=self._games, sessions=self._sessions), f)
+    def _migrate_legacy(self, aliases):
+        migrated = {}
+        for legacy, (key, path) in aliases.items():
+            old = self._games.get(legacy)
+            if old is None:
+                continue
+            old_path = old.get("path")
+            system, _, relative = key.removeprefix("esde:").partition("/")
+            folder = path[:-len(relative)].rstrip("/") or "/"
+            if old_path and (not isinstance(old_path, str) or esde.rom_relative(system, old_path, folder) != relative):
+                continue  # a previous location disagrees with the only candidate still present
+            current = self._games.get(key, {})
+            self._games[key] = dict(old, **current)
+            self._games[key].update(system=system, path=path, total=old.get("total", 0) + current.get("total", 0),
+                                    plays=old.get("plays", 0) + current.get("plays", 0),
+                                    last=max(old.get("last", 0), current.get("last", 0)))
+            del self._games[legacy]
+            migrated[legacy] = key
+        if migrated:
+            for session in self._sessions:
+                session[0] = migrated.get(session[0], session[0])
+            if self._open is not None:
+                self._open[0] = migrated.get(self._open[0], self._open[0])
+        return bool(migrated)
+
+    def _save(self):
+        if self._writes_paused:
+            self._deferred_save = True
+            return
+        self._queue_save()
+
+    def _queue_save(self):
+        self._deferred_save = False
+        # Detach the accepted state even when a baseline still has to be read.
+        snapshot = dict(imported=self._imported, games=deepcopy(self._games),
+                        sessions=deepcopy(self._sessions))
+        if not self._imported and (not self._baseline_job.done() or self._baseline_failed()):
+            self._waiting_baseline = snapshot
+            return
+        self._waiting_baseline = None
+        self._queue_snapshot(snapshot)
+
+    def _baseline_failed(self):
+        if self._baseline_error is None:
+            self._baseline_error = self._baseline_job.exception()
+            if self._baseline_error is not None:
+                LOG.warning("Could not prepare play history baseline: %s", self._baseline_error)
+        return self._baseline_error is not None
+
+    def _queue_waiting_baseline(self):
+        if self._baseline_failed():
+            raise OSError(f"Could not prepare play history baseline: {self._baseline_error}") from self._baseline_error
+        self._queue_snapshot(self._waiting_baseline)
+        self._waiting_baseline = None
+
+    def _queue_snapshot(self, snapshot):
+        if not snapshot["imported"]:
+            snapshot["steam_baseline"] = self._baseline_job.result()
+        # Keep only the newest unsent snapshot while a durable write is in progress.
+        self._pending_save = snapshot
+        if self._write_job is None:
+            self._start_save()
+
+    def _start_save(self):
+        snapshot, self._pending_save = self._pending_save, None
+        self._write_job = _background(persistence.write_json, self._path, snapshot, validate=_valid_history)
+        self._write_timer.start()
+
+    @Slot()
+    def _finish_save(self):
+        if self._write_job is None or not self._write_job.done():
+            return
+        self._write_timer.stop()
+        job, self._write_job = self._write_job, None
+        try:
+            job.result()
+        except Exception as exc:
+            self._dirty = True
+            LOG.warning("Could not save play history: %s", exc)
+        else:
+            self._dirty = False
+        if self._pending_save is not None:
+            self._start_save()
+
+    @Slot()
+    def flush(self, timeout=SHUTDOWN_TIMEOUT):
+        """Drain pending writes with one retry and a shared wait budget."""
+        deadline = time.monotonic() + timeout
+        if self._waiting_baseline is not None:
+            _, pending = wait((self._baseline_job,), timeout=max(0, deadline - time.monotonic()))
+            if pending:
+                raise TimeoutError("Timed out preparing play history")
+            self._queue_waiting_baseline()
+        self._drain_saves(deadline)
+        if self._dirty and not self._writes_paused:
+            self._save()
+            self._drain_saves(deadline)
+
+    def pauseWrites(self):
+        """Freeze a backup snapshot; later edits wait for resume or restart."""
+        self._count()
+        self._save()
+        self._writes_paused = True
+
+    def writesPending(self):
+        if self._waiting_baseline is not None:
+            if not self._baseline_job.done():
+                return True
+            self._queue_waiting_baseline()
+        self._finish_save()
+        if self._write_job is not None:
+            return True
+        if self._dirty:
+            raise OSError("Could not save play history before backup")
+        return False
+
+    def resumeWrites(self):
+        self._writes_paused = False
+        if self._deferred_save or self._dirty:
+            self._save()
+
+    @Slot()
+    def _shutdown(self):
+        try:
+            self.flush()
+        except Exception as error:
+            LOG.warning("Play history remains unsaved at shutdown: %s", error)
+        finally:
+            self._write_timer.stop()
+
+    def _drain_saves(self, deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+        while self._write_job is not None:
+            # The owner thread handles each result, even after the event loop stops.
+            try:
+                self._write_job.result(timeout=max(0, deadline - time.monotonic()))
+            except TimeoutError as error:
+                if not self._write_job.done():
+                    raise TimeoutError("Timed out saving play history") from error
+            except Exception:
+                pass
+            self._finish_save()
 
     # --- tracking ---
     def _seen(self):
+        if not self._tracking_ready:
+            # Steam may update cumulative time during a slow source read. Start
+            # local counting after that read, without waiting for title scans.
+            if not self._baseline_job.done():
+                return
+            self._tracking_ready = True
         s = self._np.state
+        if s.get("legacyKey") and s.get("romPath") and self._migrate_legacy({s["legacyKey"]: (s["key"], s["romPath"])}):
+            self._save()
+            self.changed.emit()
         if s.get("kind") == "game" and s.get("playing") and s.get("key") and s.get("system") != "":
             if self._open is None or self._open[0] != s["key"]:
                 self._end()
                 self._begin(s)
+            elif not s.get("metadataPending"):
+                rec = self._games[s["key"]]
+                fields = {field: value for field, value in self._game_details(s).items() if value}
+                if any(rec.get(field) != value for field, value in fields.items()):
+                    rec.update(fields)
+                    self._save()
+                    self.changed.emit()
         else:
             self._end()
 
     def _begin(self, s):
         rec = self._games.setdefault(s["key"], dict(total=0, plays=0))
-        rec.update(title=s.get("title") or s["key"], system=s.get("system", ""), path=s.get("path", ""), art=s.get("fanart") or s.get("logo") or "", last=time.time())
+        details = self._game_details(s)
+        if s.get("metadataPending"):
+            # Keep already known metadata until the authoritative result arrives.
+            details = {field: value for field, value in details.items() if not rec.get(field)}
+        rec.update(details, last=time.time())
         rec["plays"] = rec.get("plays", 0) + 1
         self._sessions.append([s["key"], int(time.time()), 0])
         self._open = [s["key"], int(time.time()), 0, time.monotonic()]
         self._save()
         self.changed.emit()
+
+    @staticmethod
+    def _game_details(s):
+        return dict(title=s.get("title") or s["key"], system=s.get("system", ""), path=s.get("romPath") or s.get("path", ""),
+                    art=s.get("fanart") or s.get("logo") or "")
 
     def _count(self):
         """Adds what has passed since the last count to the open session and the game's total."""
@@ -123,8 +408,10 @@ class History(QObject):
         return add
 
     def _tick(self):
-        if self._open is not None and self._count():
+        counted = self._open is not None and self._count()
+        if counted or self._dirty:
             self._save()
+        if counted:
             self.changed.emit()
 
     def _end(self):
@@ -148,7 +435,7 @@ class History(QObject):
 
     def recent(self, limit=12):
         """[(key, record)], the most recently played first."""
-        items = [(k, r) for k, r in self._games.items() if r.get("last")]
+        items = [(k, self._launch_record(k, r)) for k, r in self._games.items() if r.get("last")]
         return sorted(items, key=lambda kr: kr[1]["last"], reverse=True)[:limit]
 
     def title_of(self, key):
@@ -157,7 +444,9 @@ class History(QObject):
         if t and t != key:
             return t
         if key.startswith("steam/"):
-            return self._steam_titles().get("steam:" + key[6:], "")
+            return self._titles.get("steam:" + key[6:], "")
+        if key.startswith("esde:"):
+            return os.path.splitext(os.path.basename(key))[0]
         return key.split("/", 1)[1] if "/" in key else ""
 
     def total_for(self, key):
@@ -172,13 +461,21 @@ class History(QObject):
 
     def favorites(self):
         """[(key, record)] of the games marked as favorite."""
-        return [(k, r) for k, r in self._games.items() if r.get("favorite")]
+        return [(k, self._launch_record(k, r)) for k, r in self._games.items() if r.get("favorite")]
+
+    @staticmethod
+    def _launch_record(key, record):
+        # Legacy records might contain the last sibling played, not the game
+        # that earned the favorite or accumulated the earlier play time.
+        return dict(record, path="") if esde.legacy_key_parts(key) else record
 
     @Slot(str, str, str, str)
     def toggleFavorite(self, key, title, system, path):
         """Heart or un-heart a game; a game never played gets a record without a play time or a last-played date."""
         if not key:
             return
+        if self._np.state.get("key") == key:
+            path = self._np.state.get("romPath") or path
         rec = self._games.setdefault(key, dict(title=title or key, system=system, path=path, total=0, plays=0))
         rec["favorite"] = not rec.get("favorite")
         self._save()
