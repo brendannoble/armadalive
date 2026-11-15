@@ -3,6 +3,8 @@ import glob, http.client, json, os, re, time, urllib.request
 from collections import OrderedDict
 from PySide6.QtCore import QObject, QUrl, Signal, Slot
 
+from functools import lru_cache
+
 from . import nowplaying, persistence, steamlib
 from .poller import Poller
 
@@ -19,16 +21,20 @@ def _empty_fields():
 
 
 def _pictures(system, base, kind):
-    return [QUrl.fromLocalFile(p).toString() for p in sorted(glob.glob(f"{glob.escape(nowplaying.MEDIA)}/{glob.escape(system)}/{kind}/{glob.escape(base)}.*"))]
-
+    folder = glob.escape(f"{nowplaying.MEDIA}/{system}/{kind}/")
+    paths = glob.glob(folder + glob.escape(base) + ".*") or glob.glob(folder + glob.escape(os.path.basename(base)) + ".*")
+    return [QUrl.fromLocalFile(p).toString() for p in sorted(paths)]
 
 def read(system, path):
     """{name, desc, genre, developer, year, rating (0..5, or 0), players, cover, shots} for a ROM; fields ES-DE has no entry for stay empty."""
     out = _empty_fields()
     if not re.fullmatch(r"[\w.-]+", system) or system in (".", "..") or not path:
         return out
-    base = os.path.splitext(os.path.basename(path))[0]
-    g = nowplaying._gamelist_entries(system).get(os.path.basename(path))
+    folder = nowplaying._rom_folder(system)
+    entries, basenames = nowplaying._gamelist(system, folder)
+    relative = nowplaying._gamelist_path(system, path, folder, basenames)
+    base = os.path.splitext(relative or os.path.basename(path))[0]
+    g = entries.get(relative)
     if g is not None:
         text = lambda tag: (g.findtext(tag) or "").strip()
         try:
@@ -42,21 +48,36 @@ def read(system, path):
     out["shots"] = _pictures(system, base, "screenshots")[:3] + _pictures(system, base, "titlescreens")[:1]
     return out
 
-
 def _plain(text):
     return re.sub(r"[^a-z0-9]+", "", text.casefold())
 
 
+@lru_cache(maxsize=64)
+def _title_index(gamelist, stamp, system, folder, location):
+    entries, _ = nowplaying._gamelist(system, folder, os.path.dirname(os.path.dirname(gamelist)))
+    titles = {}
+    for path, game in entries.items():
+        title = _plain(game.findtext("name") or "")
+        titles[title] = "" if title in titles else path
+    return titles
+
+
 def find(title):
-    """(system, file name) of the ES-DE game with this name, or ("", "") - for a game that runs as a Steam shortcut and so has no ROM path of its own."""
+    """Find a unique normalized title for presentation, never saved identity proof."""
     want = _plain(title)
+    matches = []
     if want:
-        for f in sorted(glob.glob(glob.escape(nowplaying.GAMELISTS) + "/*/gamelist.xml")):
-            system = os.path.basename(os.path.dirname(f))
-            for name, g in nowplaying._gamelist_entries(system).items():
-                if _plain(g.findtext("name") or "") == want:
-                    return system, name
-    return "", ""
+        root, definitions = nowplaying._rom_configuration()
+        for file in sorted(glob.glob(glob.escape(nowplaying.GAMELISTS) + "/*/gamelist.xml")):
+            system = os.path.basename(os.path.dirname(file))
+            folder = nowplaying._system_folder(system, root, definitions.get(system))
+            titles = _title_index(file, nowplaying._stamp(file), system, folder,
+                                  (os.path.realpath(folder), nowplaying._stamp(folder)))
+            if want in titles:
+                if not titles[want]:
+                    return "", ""
+                matches.append((system, titles[want]))
+    return matches[0] if len(matches) == 1 else ("", "")
 
 
 def _steam_fetch(appid, lang):

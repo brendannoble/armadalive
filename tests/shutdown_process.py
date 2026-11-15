@@ -36,7 +36,7 @@ def gate_write(real_write, entered, release):
     def write(*args, **kwargs):
         entered.set()
         release.wait(30)
-        real_write(*args, **kwargs)
+        return real_write(*args, **kwargs)
     return write
 
 

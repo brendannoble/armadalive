@@ -67,6 +67,14 @@ class Folders(unittest.TestCase):
             a.randomIn("smart:favorites")
         launch.assert_called_once_with("esde:snes/B.sfc")
 
+    def test_canonical_favorites_follow_identity_before_stale_or_reused_paths(self):
+        backend = self.make([
+            ("esde:snes/A.sfc", dict(path="/old-mount/snes/A.sfc", favorite=True)),
+            ("esde:snes/Missing.sfc", dict(path="/roms/snes/B.sfc", favorite=True)),
+        ])
+        self.assertEqual([item["id"] for item in backend.folderItems("smart:favorites")], ["esde:snes/A.sfc"])
+        self.assertEqual([item["id"] for item in backend.folderItems("smart:recent")], ["esde:snes/A.sfc"])
+
     def test_a_system_smart_folder_lists_its_games_by_name_and_only_for_systems_that_have_games(self):
         a = self.make()
         a.assign(0, "smart:esde:snes")

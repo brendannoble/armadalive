@@ -1,9 +1,10 @@
 """Remembers a power profile and FPS limit for a game, a whole system, every other game (the base rule) or for when no game runs
 (the idle rule), and applies it when that game starts or the last game ends."""
-import json, math, os
+import json, logging, math, os
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
-from . import emusettings, persistence
+from . import emusettings, persistence, nowplaying as esde
 
+LOG = logging.getLogger(__name__)
 CONFIG = os.path.expanduser("~/.config/armadalive/game_rules.json")
 
 
@@ -47,6 +48,8 @@ class GameRules(persistence.OwnerWriter, QObject):
     def __init__(self, nowplaying, gamescope, system):
         super().__init__()
         self._np, self._gs, self._sys = nowplaying, gamescope, system
+        self._identities = nowplaying.identities
+        self._file_version = esde._stamp(CONFIG)
         saved = persistence.read_json(CONFIG, validate_settings, {})
         self._saved = saved
         self._rules, self._on = saved.get("rules", {}), bool(saved.get("enabled", True))
@@ -64,11 +67,15 @@ class GameRules(persistence.OwnerWriter, QObject):
                     self._base_error = "Cannot save game rules: invalid device-local emulator originals"
         except (OSError, ValueError, RecursionError):
             pass  # Keep originals from the validated recovery copy, if available.
-        self._check_deferred = False
+        self._check_deferred = self._restoring = False
         self._applied, self._loaded = "", ""
         self._pending_rule = None
+        self._checked = False
+        self._scopes = self._current_scopes(nowplaying.state)
         self.history = None      # set by the app: lets a rule show the name of its game, not only the key
         nowplaying.changed.connect(self._check)
+        self._identities.changed.connect(self._check)
+        self._watch_legacy_rules()
         system.profileFinished.connect(self._profile_finished)
         gamescope.fpsLimitFinished.connect(self._fps_finished)
         system.profileRequested.connect(self._profile_requested)
@@ -90,15 +97,70 @@ class GameRules(persistence.OwnerWriter, QObject):
             return dict(kind="game", name=rule.get("title") or (self.history.title_of(rest) if self.history else "") or rest)
         return dict(kind="system", name=rest)
 
+    def _current_scopes(self, state):
+        return self._game_key(state), self._system_key(state), state.get("system") in emusettings.SPECS
+
     @staticmethod
-    def _game_key(state):
+    def _canonical_game_key(state):
         return f"game:{state['key']}" if state.get("key") else ""
+
+    def _legacy_game_key(self, state):
+        legacy = esde._legacy_key_for_game(state.get("key", ""))
+        return f"game:{legacy}" if legacy and self._identities.identity(legacy) == state["key"] else ""
+
+    def _game_key(self, state):
+        canonical = self._canonical_game_key(state)
+        legacy = self._legacy_game_key(state)
+        return legacy if canonical not in self._rules and legacy in self._rules else canonical
+
+    def _pending_legacy_rule(self, state):
+        if self._canonical_game_key(state) in self._rules:
+            return ""
+        legacy = esde._legacy_key_for_game(state.get("key", ""))
+        return f"game:{legacy}" if (f"game:{legacy}" in self._rules
+                                   and self._identities.identity(legacy) is None) else ""
+
+    def _watch_legacy_rules(self):
+        self._identities.watch_rules(key[5:] for key in self._rules if key.startswith("game:"))
+
+    def _migrate_game_rules(self):
+        if self._file_version != esde._stamp(CONFIG):
+            return False
+        previous = self._rules
+        updated = dict(previous)
+        for key, (target, _) in self._identities.rule_aliases().items():
+            legacy, canonical = f"game:{key}", f"game:{target}"
+            if legacy in updated and canonical not in updated:
+                updated[canonical] = updated.pop(legacy)
+        if updated == previous:
+            return False
+        self._rules = updated
+        try:
+            self._save()
+        except (OSError, ValueError) as error:
+            self._rules = previous
+            # Replacement can succeed before directory sync reports failure.
+            # Retry only that exact candidate, never a different restored file.
+            expected = dict(self._saved, enabled=self._on, rules=updated, base=self._base)
+            try:
+                with open(CONFIG) as stream:
+                    content = json.load(stream)
+                    info = os.fstat(stream.fileno())
+                version = info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size
+                if content == expected and version == esde._stamp(CONFIG):
+                    self._file_version = version
+            except (OSError, ValueError, RecursionError):
+                pass
+            LOG.warning("Could not migrate game rules: %s", error)
+            return False
+        return True
 
     @staticmethod
     def _system_key(state):
         return f"system:{state['system']}" if state.get("system") and state.get("kind") == "game" else ""
 
     def pauseWrites(self, *, restoring=False):
+        self._restoring = restoring
         super().pauseWrites(restoring=restoring)
         # Emulator originals can change on the owner thread between explicit
         # rule edits. Persist them before backup captures the local rollback state.
@@ -120,8 +182,9 @@ class GameRules(persistence.OwnerWriter, QObject):
         saved = dict(self._saved, enabled=self._on, rules=self._rules, base=self._base)
         if not validate_settings(saved):
             raise ValueError("invalid game rules")
-        persistence.write_json(CONFIG, saved, validate=validate_settings, indent=1,
+        self._file_version = persistence.write_json(CONFIG, saved, validate=validate_settings, indent=1,
                                follow_symlinks=True, require_writable=True, allow_nan=True)
+        self._watch_legacy_rules()
         self.changed.emit()
 
     @staticmethod
@@ -143,6 +206,8 @@ class GameRules(persistence.OwnerWriter, QObject):
             return
         if key in self._rules:
             del self._rules[key]
+            if scope == "game" and key == self._canonical_game_key(cur):
+                self._rules.pop(self._legacy_game_key(cur), None)
             code = "removed"
         else:
             self._rules[key] = dict(profile=self._sys.stats.get("profile", ""), fps=self._gs.state.get("limit", 0))
@@ -191,6 +256,8 @@ class GameRules(persistence.OwnerWriter, QObject):
         """Just before a game starts (while it is selected in ES-DE) its emulator gets the saved resolution; a game without one
         gets back what the emulator had before. shortcut: only the first override remembers the original value."""
         system = cur.get("system")
+        if self._pending_legacy_rule(cur):
+            return
         if cur.get("kind") != "game" or cur.get("playing") or system not in emusettings.SPECS:
             return
         rule = self._rules.get(self._game_key(cur)) or self._rules.get(self._system_key(cur)) or {}
@@ -262,6 +329,9 @@ class GameRules(persistence.OwnerWriter, QObject):
 
     def resumeWrites(self):
         super().resumeWrites()
+        if self._restoring:
+            self._file_version = esde._stamp(CONFIG)
+            self._restoring = False
         if self._check_deferred:
             self._check_deferred = False
             self._check()
@@ -271,6 +341,11 @@ class GameRules(persistence.OwnerWriter, QObject):
             self._check_deferred = True
             return
         cur = self._np.state
+        migrated = self._migrate_game_rules()
+        scopes = self._current_scopes(cur)
+        if migrated or scopes != self._scopes:
+            self._scopes = scopes
+            self.changed.emit()
         if self._on:
             self._emulator(cur)
         if not cur.get("playing"):
@@ -281,10 +356,14 @@ class GameRules(persistence.OwnerWriter, QObject):
                 if self._on and IDLE in self._rules:
                     self._apply(self._rules[IDLE], "idle")
             return
-        if not self._on or cur.get("key") == self._applied:
+        game = cur.get("key", "")
+        if game != self._applied:
+            self._applied = game
+            self._checked = False
+            self._pending_rule = None
+        if not self._on or not game or self._checked or self._pending_legacy_rule(cur):
             return
-        self._applied = cur.get("key", "")
-        self._pending_rule = None
+        self._checked = True
         for key, label in ((self._game_key(cur), "game"), (self._system_key(cur), "system"), (BASE, "base")):
             if key in self._rules:
                 self._apply(self._rules[key], f"{cur.get('title') or cur.get('key')}" if label == "game" else label)

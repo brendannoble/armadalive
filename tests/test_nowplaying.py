@@ -1,4 +1,4 @@
-import builtins, tempfile, threading, time, unittest
+import os, builtins, tempfile, threading, time, unittest
 from unittest import mock
 
 from PySide6.QtCore import QTimer
@@ -8,9 +8,116 @@ from armadalive import gamerules, history, nowplaying as n
 
 
 class Describe(unittest.TestCase):
+
+    def test_history_and_rule_keys_consider_unlisted_and_hidden_siblings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = f"{directory}/collection"
+            touch(f"{directory}/settings/es_settings.xml", f'<string name="ROMDirectory" value="{root}" />')
+            touch(f"{directory}/custom_systems/es_systems.xml", """<systemList>
+                <system><name>snes</name><path>%ROMPATH%/custom</path><extension>.sfc .zip</extension></system>
+                </systemList>""")
+            touch(f"{directory}/gamelists/snes/gamelist.xml", """<gameList>
+                <game><path>./a/Same.sfc</path><hidden>true</hidden></game>
+                <game><path>./a/Unique.sfc</path><name>Unique</name></game>
+                </gameList>""")
+            for rom in ("a/Same.sfc", "b/Same.zip", "a/Unique.sfc"):
+                touch(f"{root}/custom/{rom}")
+            with (mock.patch.object(n, "ES", directory), mock.patch.object(n, "GAMELISTS", directory + "/gamelists")):
+                one = n.describe(dict(GAME, path=f"{root}/custom/a/Same.sfc"))
+                two = n.describe(dict(GAME, path="b/Same.zip"))
+                unique = n.describe(dict(GAME, path="a/Unique.sfc"))
+                aliases = n.resolve_legacy_keys({"snes/Same", "snes/Unique"}, n.GAMELISTS)
+            self.assertEqual((one["key"], two["key"], unique["key"]),
+                             ("esde:snes/a/Same.sfc", "esde:snes/b/Same.zip", "esde:snes/a/Unique.sfc"))
+            self.assertEqual(set(aliases), {"snes/Unique"})
+            self.assertEqual(aliases["snes/Unique"][0], unique["key"])
+
+
+    def test_unresolved_gamelist_path_cannot_make_a_legacy_rule_unique(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = f"{directory}/current/roms/snes"
+            other = f"{directory}/different/roms/snes/A.sfc"
+            touch(f"{folder}/A.sfc")
+            touch(other)
+            touch(f"{directory}/custom_systems/es_systems.xml", f"""<systemList>
+                <system><name>snes</name><path>{folder}</path><extension>.sfc</extension></system>
+                </systemList>""")
+            touch(f"{directory}/gamelists/snes/gamelist.xml", f"<gameList><game><path>{other}</path></game></gameList>")
+            with (mock.patch.object(n, "ES", directory), mock.patch.object(n, "GAMELISTS", f"{directory}/gamelists")):
+                self.assertEqual(n.describe(dict(GAME, path=f"{folder}/A.sfc"))["legacyKey"], "")
+                self.assertEqual(n.describe(dict(GAME, path=other))["key"], "")
+
+
+    def test_retargeted_system_root_invalidates_cached_path_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original, current = f"{directory}/original", f"{directory}/current"
+            linked = f"{directory}/linked"
+            for folder in (original, current):
+                touch(f"{folder}/Unique.sfc")
+            os.symlink(original, linked)
+            touch(f"{directory}/custom_systems/es_systems.xml", f"""<systemList>
+                <system><name>snes</name><path>{linked}</path><extension>.sfc</extension></system>
+                </systemList>""")
+            gamelists = f"{directory}/gamelists"
+            touch(f"{gamelists}/snes/gamelist.xml", f"<gameList><game><path>{original}/Unique.sfc</path></game></gameList>")
+            with mock.patch.object(n, "ES", directory):
+                self.assertIn("snes/Unique", n.resolve_legacy_keys({"snes/Unique"}, gamelists))
+                os.unlink(linked)
+                os.symlink(current, linked)
+                self.assertNotIn("snes/Unique", n.resolve_legacy_keys({"snes/Unique"}, gamelists))
+
+
+    def test_configured_rom_root_takes_precedence_over_system_named_ancestors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = f"{directory}/snes/collection"
+            touch(f"{directory}/settings/es_settings.xml", f'<string name="ROMDirectory" value="{root}" />')
+            touch(f"{directory}/gamelists/snes/gamelist.xml", """<gameList>
+                <game><path>./Region/Unique.sfc</path><name>Correct title</name></game>
+                </gameList>""")
+            touch(f"{directory}/media/snes/fanart/Region/Unique.jpg")
+            with (mock.patch.object(n, "ES", directory),
+                  mock.patch.object(n, "GAMELISTS", directory + "/gamelists"),
+                  mock.patch.object(n, "MEDIA", directory + "/media")):
+                game = n.describe(dict(GAME, path=f"{root}/snes/Region/Unique.sfc"))
+            self.assertEqual(game["title"], "Correct title")
+            self.assertTrue(game["fanart"].endswith("/Region/Unique.jpg"))
+
+
+    def test_symlink_system_root_gives_physical_and_configured_paths_one_playing_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            physical, linked = f"{directory}/physical", f"{directory}/linked"
+            relative = "nested/Unique.sfc"
+            touch(f"{physical}/{relative}")
+            touch(f"{physical}-other/{relative}")
+            os.symlink(physical, linked)
+            touch(f"{directory}/custom_systems/es_systems.xml", f"""<systemList>
+                <system><name>snes</name><path>{linked}</path><extension>.sfc</extension></system>
+                </systemList>""")
+            with mock.patch.object(n, "ES", directory):
+                for form in (relative, f"{linked}/{relative}", f"{physical}/{relative}"):
+                    with self.subTest(form=form):
+                        state = n.describe(dict(GAME, event="game-start", path=form))
+                        self.assertEqual((state["key"], state["romPath"], state["playing"]),
+                                         (f"esde:snes/{relative}", f"{linked}/{relative}", True))
+                unrelated = n.describe(dict(GAME, event="game-start", path=f"{physical}-other/{relative}"))
+                self.assertEqual(unrelated["key"], "")
+
+
+    def test_nested_rom_title_and_media_follow_the_relative_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            touch(f"{directory}/snes/gamelist.xml", """<gameList>
+                <game><path>./a/Same.sfc</path><name>First</name></game>
+                <game><path>./b/Same.sfc</path><name>Second</name></game>
+                </gameList>""")
+            touch(f"{directory}/snes/fanart/a/Same.jpg")
+            with mock.patch.object(n, "GAMELISTS", directory), mock.patch.object(n, "MEDIA", directory):
+                game = n.describe(dict(GAME, path=f"{ROMS}/snes/a/Same.sfc"))
+            self.assertEqual(game["title"], "First")
+            self.assertTrue(game["fanart"].endswith("/a/Same.jpg"))
+
     def test_game_has_art_and_key(self):
         d = n.describe(GAME)
-        self.assertEqual((d["kind"], d["title"], d["key"], d["system"]), ("game", "Super Game", "snes/Super Game (EU)", "snes"))
+        self.assertEqual((d["kind"], d["title"], d["key"], d["system"]), ("game", "Super Game", "esde:snes/Super Game (EU).zip", "snes"))
         self.assertTrue(d["logo"].endswith("Super%20Game%20%28EU%29.png") or d["logo"].endswith("Super Game (EU).png"))
         self.assertTrue(d["fanart"] and d["manual"])
         self.assertFalse(d["playing"])
@@ -101,7 +208,7 @@ class Precedence(unittest.TestCase):
                 self.addCleanup(dispose_qt, tracker)
                 backend.history = tracker
                 rules_path = f"{directory}/rules.json"
-                touch(rules_path, '{"rules": {"game:snes/A": {"fps": 30}}}')
+                touch(rules_path, '{"rules": {"game:esde:snes/A.sfc": {"fps": 30}}}')
                 display = mock.Mock()
                 with mock.patch.object(gamerules, "CONFIG", rules_path):
                     rules = gamerules.GameRules(backend, display, mock.Mock())
@@ -119,7 +226,7 @@ class Precedence(unittest.TestCase):
                     backend._event = dict(backend._event, event="game-start")
                     backend._update()
                     self.assertTrue(backend.state["playing"])
-                    self.assertEqual(backend.state["key"], "snes/A")
+                    self.assertEqual(backend.state["key"], "esde:snes/A.sfc")
                     display.setFpsLimit.assert_called_once_with(30)
                     tracker._open[3] -= 12
                     backend._event = dict(GAME, path="B.sfc", name="Event B")
@@ -129,9 +236,9 @@ class Precedence(unittest.TestCase):
                     release.set()
                 wait_for(lambda: backend.state["title"] == "Scraped B")
                 self.assertNotIn("Scraped A", [state["title"] for state in published])
-                self.assertIn(("snes/A", True), [(state["key"], state["playing"]) for state in published])
-                self.assertGreaterEqual(tracker.info("snes/A")["total"], 12)
-                self.assertEqual(tracker.info("snes/A")["plays"], 1)
+                self.assertIn(("esde:snes/A.sfc", True), [(state["key"], state["playing"]) for state in published])
+                self.assertGreaterEqual(tracker.info("esde:snes/A.sfc")["total"], 12)
+                self.assertEqual(tracker.info("esde:snes/A.sfc")["plays"], 1)
 
     def test_matching_metadata_enriches_the_open_history_session(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -142,7 +249,7 @@ class Precedence(unittest.TestCase):
             self.np.history = tracker
             self.np._event, self.np._esde = dict(GAME, event="game-start"), True
             self.np._update()
-            key = "snes/Super Game (EU)"
+            key = "esde:snes/Super Game (EU).zip"
             self.assertEqual(tracker.games[key]["plays"], 1)
             self.assertEqual(tracker.games[key]["title"], "x")
             wait_for(lambda: bool(tracker.games[key].get("art")))
@@ -204,6 +311,52 @@ class Precedence(unittest.TestCase):
 
 
 class RunningGame(unittest.TestCase):
+
+    def test_a_nested_rom_keeps_every_path_component(self):
+        rom = f"{ROMS}/gbc/Region/Nested/My Game.gbc"
+        a, b, c = self.cmdline(rom)
+        with a, b, c:
+            game = n.running_game()
+        self.assertEqual(game["path"], f"{ROMS}/gbc/Region/Nested/My Game.gbc")
+        self.assertEqual(game["name"], "My Game")
+
+
+    def test_detects_running_rom_under_a_custom_system_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rom = f"{directory}/outside-roms/Region/Unique.sfc"
+            touch(f"{directory}/custom_systems/es_systems.xml", f"""<systemList>
+                <system><name>snes</name><path>{directory}/outside-roms</path><extension>.sfc</extension></system>
+                </systemList>""")
+            read_file = builtins.open
+            read_proc = mock.mock_open(read_data=f"retroarch\0-L\0/cores/core.so\0{rom}\0".encode())
+            with (mock.patch.object(n, "ES", directory),
+                  mock.patch("os.listdir", return_value=["42"]),
+                  mock.patch("builtins.open", side_effect=lambda path, *a, **kw:
+                             read_proc(path, *a, **kw) if str(path).startswith("/proc/") else read_file(path, *a, **kw))):
+                game = n.running_game()
+                self.assertEqual((game["system"], game["path"], n.describe(game)["key"]),
+                                 ("snes", rom, "esde:snes/Region/Unique.sfc"))
+
+
+    def test_detects_physical_path_for_a_symlink_configured_system(self):
+        with tempfile.TemporaryDirectory() as directory:
+            physical, linked = f"{directory}/physical", f"{directory}/linked"
+            rom = f"{physical}/Region/Unique.sfc"
+            touch(rom)
+            os.symlink(physical, linked)
+            touch(f"{directory}/custom_systems/es_systems.xml", f"""<systemList>
+                <system><name>snes</name><path>{linked}</path><extension>.sfc</extension></system>
+                </systemList>""")
+            read_file = builtins.open
+            read_proc = mock.mock_open(read_data=f"retroarch\0{rom}\0".encode())
+            with (mock.patch.object(n, "ES", directory), mock.patch("os.listdir", return_value=["42"]),
+                  mock.patch("builtins.open", side_effect=lambda path, *a, **kw:
+                             read_proc(path, *a, **kw) if str(path).startswith("/proc/") else read_file(path, *a, **kw))):
+                game = n.running_game()
+                self.assertIsNotNone(game)
+                self.assertEqual((game["path"], n.describe(game)["key"]),
+                                 (f"{linked}/Region/Unique.sfc", "esde:snes/Region/Unique.sfc"))
+
     def cmdline(self, rom):
         args = b"\0".join(a.encode() for a in ("retroarch", "-L", "/cores/x.so", rom, "--appendconfig", "/c.cfg")) + b"\0"
         return mock.patch("builtins.open", mock.mock_open(read_data=args)), mock.patch("os.listdir", return_value=["42"]), mock.patch.object(n, "_rom_dir", return_value=ROMS)
@@ -211,7 +364,7 @@ class RunningGame(unittest.TestCase):
     def test_a_rom_under_another_mount_of_the_same_card_is_found(self):   # what Ludo starts: /run/media/EXT instead of /run/media/armada/EXT
         for rom in ("/run/media/EXT/Emulation/roms/gbc/Pokemon - Silver.gbc", ROMS + "/gbc/Pokemon - Silver.gbc"):
             a, b, c = self.cmdline(rom)
-            with a, b, c:
+            with a, b, c, mock.patch.object(n, "_same_file", return_value=True):
                 game = n.running_game()
             self.assertEqual((game["system"], game["name"]), ("gbc", "Pokemon - Silver"))
 
