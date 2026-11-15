@@ -32,6 +32,7 @@ class AppReadiness(unittest.TestCase):
         self.socket = self.enterContext(mock.patch.object(socket, "socket"))
         self.datagram = self.socket.return_value.__enter__.return_value
         self.window = mock.Mock(spec=gui.QQuickWindow)
+        self.window.presentationActiveChanged = mock.Mock()
         self.engine = gui.QQmlApplicationEngine.return_value
         self.engine.rootObjects.return_value = [self.window]
         self.application = gui.QGuiApplication.return_value
