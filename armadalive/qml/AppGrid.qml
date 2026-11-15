@@ -4,7 +4,13 @@ import QtQuick.Window
 // Idle screen: rounded square covers in three rows that scroll sideways. Tap launches, long-press (or the last, empty tile) picks the app.
 Item {
     id: grid
+    enabled: !apps.layoutEditingBlocked
     property int picking: -1
+    property int pickingLayoutSlot: -1
+    function pick(position, hasPin) {
+        pickingLayoutSlot = hasPin ? apps.layoutSlot(position) : -1
+        picking = position
+    }
     property string opened: ""      // the folder whose view is open
     onOpenedChanged: Gesture.hold(opened !== "")
     readonly property var win: Window.window || ({ width: width, height: height })
@@ -189,8 +195,12 @@ Item {
                 MouseArea {
                     id: area
                     anchors.fill: parent
-                    onClicked: { if (app.folder) grid.opened = app.id; else if (app.id) { launched.start(); apps.launch(index) } else grid.picking = index }
-                    onPressAndHold: grid.picking = index
+                    onClicked: {
+                        if (app.folder) grid.opened = app.id
+                        else if (app.id) { launched.start(); apps.launchId(app.id) }
+                        else grid.pick(index, false)
+                    }
+                    onPressAndHold: grid.pick(index, !!app.id)
                 }
             }
         }
@@ -214,6 +224,7 @@ Item {
         Behavior on opacity { NumberAnimation { duration: 180 } }
         Behavior on scale { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
         slot: grid.picking
+        layoutSlot: grid.pickingLayoutSlot
         onClosed: grid.picking = -1
     }
 }

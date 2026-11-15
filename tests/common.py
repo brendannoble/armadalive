@@ -12,6 +12,11 @@ from PySide6.QtCore import QCoreApplication, QEvent, QObject, QThreadPool, Signa
 app = QCoreApplication.instance() or QCoreApplication(sys.argv)
 
 
+def delete_qobject(obj):
+    obj.deleteLater()
+    app.sendPostedEvents(obj, QEvent.Type.DeferredDelete)
+
+
 def touch(path, text=""):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as file:

@@ -47,14 +47,24 @@ def write_bytes(path, content, *, mode=None):
     _replace(path, content, mode=mode)
 
 
-def encode_json(data, *, indent=None):
-    return json.dumps(data, indent=indent, allow_nan=False).encode()
+def encode_json(data, *, indent=None, allow_nan=False):
+    return json.dumps(data, indent=indent, allow_nan=allow_nan).encode()
 
 
-def write_json(path, data, *, validate=None, indent=None, follow_symlinks=False):
-    """Replace a JSON file. With a validator, keep its prior valid contents as .bak."""
+def write_json(path, data, *, validate=None, indent=None, follow_symlinks=False,
+               require_writable=False, allow_nan=False):
+    """Replace a JSON file. With a validator, keep its prior valid contents as .bak.
+
+    With require_writable, check write access to an existing target without
+    truncating or creating it. With allow_nan, retain legacy nonfinite values.
+    """
     path = os.path.realpath(path) if follow_symlinks else os.path.abspath(path)
-    content = encode_json(data, indent=indent)
+    content = encode_json(data, indent=indent, allow_nan=allow_nan)
+    if require_writable:
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+        except FileNotFoundError:
+            pass
     mode = None
     if follow_symlinks:
         try:
@@ -98,3 +108,22 @@ def remove(path):
     except FileNotFoundError:
         pass
     _sync_directory(os.path.dirname(os.path.abspath(path)))
+
+
+class OwnerWriter:
+    """Freeze synchronous owner-thread edits while a backup drains its writers."""
+    _writes_paused = False
+
+    def pauseWrites(self, *, restoring=False):
+        self._writes_paused = True
+        self.changed.emit()
+
+    def writesPending(self):
+        return False
+
+    def resumeWrites(self):
+        self._writes_paused = False
+        self.changed.emit()
+
+    def flush(self, timeout=3.0):
+        pass  # Accepted writes already completed on the owner thread.

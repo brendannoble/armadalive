@@ -313,25 +313,35 @@ Window {
         function onNotice(code, detail) {
             const text = ({ tson: Tr.t("Tailscale connected"), tsoff: Tr.t("Tailscale off"), tslogin: Tr.t("Tailscale needs a login"),
                             tsmissing: Tr.t("Tailscale is not running"), tsfail: Tr.t("Tailscale did not switch"),
-                            tsdenied: Tr.t("Run once: sudo tailscale set --operator=armada") })[code]
+                            tsdenied: Tr.t("Run once: sudo tailscale set --operator=armada"),
+                            commandfail: Tr.t("Setting could not be changed") })[code]
             toast.show(text, code !== "tson" && code !== "tsoff")
+        }
+    }
+    Connections {
+        target: apps
+        function onSaveFailed(detail) {
+            toast.show(Tr.t("App layout could not be saved") + (detail ? ": " + detail : ""), true)
         }
     }
     // short messages from the app: something was done (accent colour) or went wrong (red)
     Connections {
         target: steamShortcuts
-        function onNotice(code, title) {
+        function onNotice(code, detail) {
             const text = ({ created: Tr.t("Shortcut created"), exists: Tr.t("Already in Steam"), unknown: Tr.t("Launch the game from ES-DE once first"),
-                            unreachable: Tr.t("Steam is not reachable") })[code]
-            toast.show(title && code !== "unknown" ? text + ": " + title : text, code !== "created")
+                            unreachable: Tr.t("Steam could not complete the shortcut"), prepareFailed: Tr.t("Could not prepare the Steam shortcut"),
+                            launchUnavailable: Tr.t("No launch command is available"), launchFailed: Tr.t("Steam could not start the game"),
+                            launchRequested: Tr.t("Launch requested") })[code]
+            if (text) toast.show(detail && code !== "unknown" ? text + ": " + detail : text, code !== "created" && code !== "launchRequested")
         }
     }
     // saving, removing and loading a game rule
     Connections {
         target: rules
         function onNotice(code, detail) {
-            const text = ({ saved: Tr.t("Rule saved"), removed: Tr.t("Rule removed"), loaded: Tr.t("Rule loaded") })[code]
-            toast.show(text + ": " + detail, false)
+            const text = ({ saved: Tr.t("Rule saved"), removed: Tr.t("Rule removed"), loaded: Tr.t("Rule loaded"),
+                            failed: Tr.t("Rule failed") })[code]
+            toast.show(text + ": " + detail, code === "failed")
         }
     }
     Rectangle {

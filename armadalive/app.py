@@ -13,7 +13,7 @@ from .gameinfo import GameInfo
 from .history import History
 from . import steamlib
 from .ayn import AynButton
-from .backup import Backup
+from .backup import Backup, recover_restore
 from .battery import Battery
 from .closer import Closer
 from .gamepad import Pad
@@ -46,7 +46,22 @@ from .emulator_control import EmulatorControl
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def install_signal_handlers(app, ayn):
+    def request_exit(signum, _frame):
+        # A nonzero exit lets the launcher retry when the Plasma session appears.
+        QTimer.singleShot(0, lambda: app.exit(128 + signum))
+
+    signal.signal(signal.SIGTERM, request_exit)
+    signal.signal(signal.SIGINT, request_exit)
+    signal.signal(signal.SIGUSR1, lambda *_: ayn.pressed.emit())
+    signal.signal(signal.SIGUSR2, lambda *_: (ayn.pressed.emit(), ayn.released.emit()))
+    wake = QTimer(app)
+    wake.timeout.connect(lambda: None)  # Let Python handle signals while Qt is idle.
+    wake.start(250)
+
+
 def main():
+    recover_restore(startup=True)  # Finish recovery before any backend reads or writes configuration.
     app = QGuiApplication(sys.argv)
     app.setApplicationName("ArmadaLive")
     app.setApplicationVersion(__version__)
@@ -58,11 +73,17 @@ def main():
     now, monitor = NowPlaying(gamescope, steamui), SystemMonitor(fps=lambda: gamescope.state["fps"])
     layout = ControlsLayout()
     emulator_ctrl = EmulatorControl()
-    history = History(now, steam_titles=lambda: {g["id"]: g["name"] for g in steamlib.games()})
+    history = History(now, steam_titles=lambda: {g["id"]: g["name"] for g in steamlib.games(art=False)})
     now.history = history
-    backends = dict(steamui=steamui, gamescope=gamescope, nowPlaying=now, system=monitor, ayn=AynButton(), settings=Settings(), apps=Apps(history), history=history, gameinfo=GameInfo(history), shell=Shell(), controls=Controls(), ui=UiSettings(), updater=Updater(), admin=Admin(),
-                    health=Health(steamui), rules=GameRules(now, gamescope, monitor), tileStore=Tiles(),
-                    battery=Battery(), media=Media(), backup=Backup(), artwork=Palette(), steamShortcuts=SteamShortcuts(now), tasks=Tasks(), onboarding=Onboarding(), activity=Activity(), manuals=Manuals(), ludo=LudoSync(), trackpad=Trackpad(), cheats=Cheats(), layout=layout, emulatorControl=emulator_ctrl)
+    shortcuts = SteamShortcuts(now)
+    app_catalog = Apps(history, shortcuts)
+    ui, tiles, battery = UiSettings(), Tiles(), Battery()
+    rules = GameRules(now, gamescope, monitor)
+    backup = Backup((app_catalog, history, ui, tiles, battery, rules))
+    app.aboutToQuit.connect(backup.flushWriters)
+    backends = dict(steamui=steamui, gamescope=gamescope, nowPlaying=now, system=monitor, ayn=AynButton(), settings=Settings(), apps=app_catalog, history=history, gameinfo=GameInfo(history), shell=Shell(), controls=Controls(), ui=ui, updater=Updater(), admin=Admin(),
+                    health=Health(steamui), rules=rules, tileStore=tiles,
+                    battery=battery, media=Media(), backup=backup, artwork=Palette(), steamShortcuts=shortcuts, tasks=Tasks(), onboarding=Onboarding(), activity=Activity(), manuals=Manuals(), ludo=LudoSync(), trackpad=Trackpad(), cheats=Cheats(), layout=layout, emulatorControl=emulator_ctrl)
     pad = backends["pad"] = Pad()   # must stay referenced, like the rest
     backends["closer"] = Closer(pad, gamescope, now, backends["ui"])
     backends["thermal"] = Thermal(monitor, backends["ui"])
@@ -71,13 +92,7 @@ def main():
         engine.rootContext().setContextProperty(name, obj)
     # closing the window only hides it: the app keeps listening for the AYN button and can bring itself back
     app.setQuitOnLastWindowClosed(False)
-    # SIGUSR1 does what the AYN button does (used by the app-drawer launcher)
-    signal.signal(signal.SIGUSR1, lambda *_: backends["ayn"].pressed.emit())
-    # SIGUSR2 is a whole tap of it (press and release), which toggles; here so the toggle can be tried without the button
-    signal.signal(signal.SIGUSR2, lambda *_: (backends["ayn"].pressed.emit(), backends["ayn"].released.emit()))
-    wake = QTimer()
-    wake.timeout.connect(lambda: None)  # keeps the interpreter running so it notices the signal
-    wake.start(250)
+    install_signal_handlers(app, backends["ayn"])
     engine.load(QUrl.fromLocalFile(HERE + "/qml/Main.qml"))
     if not engine.rootObjects():
         return 1
