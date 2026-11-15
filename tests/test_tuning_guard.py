@@ -1,5 +1,6 @@
 import copy, json, os, subprocess, sys, tempfile, threading, time, unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from shiboken6 import delete
@@ -413,7 +414,8 @@ class ReloadGuard(SettingsTestCase):
                                               FACTORY=etc / "factory", GPU_FREQS=etc / "freqs", GOVERNORS=etc / "governors"))
         self.enterContext(mock.patch.object(settings.privileged, "HELPER", helper))
         self.enterContext(mock.patch.object(settings.privileged, "available", return_value=True))
-        self.enterContext(mock.patch.object(settings.privileged.subprocess, "run", side_effect=fake_sudo))
+        helper_process = SimpleNamespace(run=fake_sudo, TimeoutExpired=subprocess.TimeoutExpired)
+        self.enterContext(mock.patch.object(settings.privileged, "subprocess", helper_process))
         self.settings = self.start_backend()
         self.messages = []
         self.settings.message.connect(self.messages.append)
