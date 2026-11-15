@@ -105,6 +105,7 @@ case "$2" in
     disable) printf 'disabled\n' > "$HOME/enabled" ;;
     stop) printf 'inactive\n' > "$HOME/active" ;;
     restart)
+        [ "$#" = 3 ] && [ "$3" = armadalive ] || exit 2
         if [ -f "$HOME/.local/share/armadalive/armadalive/previous.py" ]; then
             printf 'old\n' >> "$HOME/restarts"
             if [ "$FAIL_STAGE" = recovery ]; then
@@ -114,6 +115,21 @@ case "$2" in
         else
             printf 'new\n' >> "$HOME/restarts"
             case "$FAIL_STAGE" in
+            startup_ready|startup_failure|startup_timeout)
+                # With Type=simple the start job finishes before any of these outcomes.
+                unit="$HOME/.config/systemd/user/armadalive.service"
+                if grep -qx 'Type=notify' "$unit"; then
+                    find "$HOME/.local/share/armadalive" -name previous.py -exec cat {} + > "$HOME/startup-backups"
+                    # The fallback starts Python as a child, so NotifyAccess=main drops its datagram.
+                    if [ "$FAIL_STAGE" = startup_ready ] && grep -qx 'NotifyAccess=all' "$unit"; then
+                        touch "$HOME/app-ready"
+                    else
+                        printf 'inactive\n' > "$HOME/active"
+                        touch "$HOME/failure-injected"
+                        exit 1
+                    fi
+                fi
+                ;;
             restart|inactive|recovery)
                 printf 'inactive\n' > "$HOME/active"
                 touch "$HOME/failure-injected"
@@ -286,6 +302,21 @@ exec /bin/rm "$@"
         self.assertEqual(self.active.read_text(), "active\n")
         self.assertEqual(self.enabled.read_text(), "enabled\n")
 
+    def assert_startup_rollback(self, outcome):
+        result = self.run_installer(outcome)
+        self.assert_injected_failure(result)
+        self.assertEqual((self.home / "startup-backups").read_text(), "previous app\n")
+        self.assert_previous_installation()
+        self.assertEqual((self.home / "restarts").read_text(), "new\nold\n")
+        self.assertEqual(self.active.read_text(), "active\n")
+        self.assertEqual(self.enabled.read_text(), "enabled\n")
+
+    def test_application_exit_before_readiness_rolls_back(self):
+        self.assert_startup_rollback("startup_failure")
+
+    def test_service_timeout_without_notification_rolls_back(self):
+        self.assert_startup_rollback("startup_timeout")
+
     def test_failed_recovery_restart_reports_retained_staging(self):
         result = self.run_installer("recovery")
         self.assert_injected_failure(result)
@@ -348,8 +379,10 @@ exec /bin/rm "$@"
 
     def test_success_replaces_app_scripts_and_hooks_without_moving_private_environment(self):
         original_python = self.private_python.stat()
-        result = self.run_installer(enabled="disabled")
+        result = self.run_installer("startup_ready", enabled="disabled")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.home / "app-ready").exists())
+        self.assertEqual((self.home / "startup-backups").read_text(), "previous app\n")
         self.assertFalse((self.share / "armadalive/previous.py").exists())
         self.assertTrue((self.share / "armadalive/qml/Main.qml").is_file())
         self.assertTrue(os.access(self.share / "scripts/run.sh", os.X_OK))
