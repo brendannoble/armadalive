@@ -16,7 +16,7 @@ from unittest.mock import patch
 from PySide6.QtCore import QCoreApplication, QEvent, Qt
 
 from tests.common import app
-from armadalive import updater
+from armadalive import shell, updater
 
 
 run = subprocess.run
@@ -44,7 +44,12 @@ class Update(unittest.TestCase):
         self.enterContext(patch.object(updater, "CACHE", str(self.cache)))
         self.enterContext(patch.object(updater, "REPO_ID", "o/r"))
         self.enterContext(patch.object(updater, "_get", self.get))
-        self.enterContext(patch.object(updater.subprocess, "run", self.launch))
+        launcher = SimpleNamespace(
+            run=self.launch,
+            CalledProcessError=subprocess.CalledProcessError,
+            TimeoutExpired=subprocess.TimeoutExpired,
+        )
+        self.enterContext(patch.object(updater, "subprocess", launcher))
         self.release = {"tag_name": "v99.0.0", "assets": [
             {"name": updater.ASSET, "browser_download_url": self.tarball_url},
             {"name": updater.CHECKSUM, "browser_download_url": self.checksum_url},
@@ -314,6 +319,22 @@ print(json.dumps(updater.Updater().state))
         self.wait_for(third, "started")
         self.assertEqual(self.downloads, 1)
         self.assertEqual(len(self.launches), 1)
+
+    def test_shell_subprocess_can_run_during_an_update(self):
+        backend = updater.Updater()
+        self.offer(backend)
+        self.release_download.clear()
+        backend.install()
+        try:
+            self.assertTrue(self.downloading.wait(2))
+            result = shell.subprocess.run(
+                [sys.executable, "-c", "print('shell probe')"],
+                check=True, capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(result.stdout, "shell probe\n")
+        finally:
+            self.release_download.set()
+            self.wait_for(backend, "started")
 
     def test_worker_state_changes_run_on_the_owner_thread(self):
         backend = updater.Updater()
