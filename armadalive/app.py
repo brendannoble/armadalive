@@ -1,6 +1,6 @@
-import json, os, signal, sys
+import json, os, signal, sys, time
 from PySide6.QtCore import QObject, QPoint, QTimer, QUrl, Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QWindow
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickWindow
 from PySide6.QtTest import QTest
@@ -8,6 +8,7 @@ from PySide6.QtTest import QTest
 from . import __version__
 from .admin import Admin
 from .apps import Apps
+from .artwork import VectorArtwork
 from .gameinfo import GameInfo
 from .history import History
 from . import steamlib
@@ -51,16 +52,18 @@ def main():
     app.setApplicationVersion(__version__)
     app.setDesktopFileName("armadalive")
     engine = QQmlApplicationEngine()
+    engine.addImageProvider("vectors", VectorArtwork())
     # the context does not own these objects: keep them referenced for the life of the app
     gamescope, steamui = Gamescope(), SteamUi()
     now, monitor = NowPlaying(gamescope, steamui), SystemMonitor(fps=lambda: gamescope.state["fps"])
     layout = ControlsLayout()
     emulator_ctrl = EmulatorControl()
-    history = History(now, steam_titles=lambda: {g["id"]: g["name"] for g in steamlib.games()})
+    history = History(now, steam_titles=lambda: {g["id"]: g["name"] for g in steamlib.games(art=False)})
     now.history = history
-    backends = dict(steamui=steamui, gamescope=gamescope, nowPlaying=now, system=monitor, ayn=AynButton(), settings=Settings(), apps=Apps(history), history=history, gameinfo=GameInfo(history), shell=Shell(), controls=Controls(), ui=UiSettings(), updater=Updater(), admin=Admin(),
+    app_catalog = Apps(history)
+    backends = dict(steamui=steamui, gamescope=gamescope, nowPlaying=now, system=monitor, ayn=AynButton(), settings=Settings(), apps=app_catalog, history=history, gameinfo=GameInfo(history), shell=Shell(), controls=Controls(), ui=UiSettings(), updater=Updater(), admin=Admin(),
                     health=Health(steamui), rules=GameRules(now, gamescope, monitor), tileStore=Tiles(),
-                    battery=Battery(), media=Media(), backup=Backup(), artwork=Palette(), steamShortcuts=SteamShortcuts(now), tasks=Tasks(), onboarding=Onboarding(), activity=Activity(), manuals=Manuals(), ludo=LudoSync(), trackpad=Trackpad(), cheats=Cheats(), layout=layout, emulatorControl=emulator_ctrl)
+                    battery=Battery(), media=Media(), backup=Backup(writers=(app_catalog, history)), artwork=Palette(), steamShortcuts=SteamShortcuts(now), tasks=Tasks(), onboarding=Onboarding(), activity=Activity(), manuals=Manuals(), ludo=LudoSync(), trackpad=Trackpad(), cheats=Cheats(), layout=layout, emulatorControl=emulator_ctrl)
     pad = backends["pad"] = Pad()   # must stay referenced, like the rest
     backends["closer"] = Closer(pad, gamescope, now, backends["ui"])
     backends["thermal"] = Thermal(monitor, backends["ui"])
@@ -79,10 +82,21 @@ def main():
     engine.load(QUrl.fromLocalFile(HERE + "/qml/Main.qml"))
     if not engine.rootObjects():
         return 1
+    window = engine.rootObjects()[0]
+    presentation = (monitor, gamescope, backends["admin"], backends["controls"], backends["health"], backends["media"])
+
+    def update_presentation(*_):
+        active = window.isVisible() and window.visibility() != QWindow.Visibility.Minimized and not window.property("blanked")
+        for backend in presentation:
+            backend.set_active(active)
+
+    window.visibleChanged.connect(update_presentation)
+    window.visibilityChanged.connect(update_presentation)
+    window.blankedChanged.connect(update_presentation)
+    update_presentation()
     if "--snapshot" in sys.argv:  # render the first frames to a PNG and exit, for docs and tests
         out = sys.argv[sys.argv.index("--snapshot") + 1]
         page = int(sys.argv[sys.argv.index("--page") + 1]) if "--page" in sys.argv else 0
-        window = engine.rootObjects()[0]
         # a snapshot always shows a fixed game state, otherwise whatever ES-DE or Steam is doing at that moment throws the page
         # back to "Game": {"event": {...}} like ES-DE sends, or {"ui": [appid, "name"]} for Steam's UI; none means idle
         demo = json.loads(sys.argv[sys.argv.index("--demo") + 1]) if "--demo" in sys.argv else {}
@@ -113,8 +127,8 @@ def main():
             QTimer.singleShot(int(ms), lambda: backends["nowPlaying"].pin(json.loads(later).get("event"), json.loads(later).get("ui")))
         if "--keep-demo" in sys.argv:  # show the keep-or-undo bar with 11 s left (nothing is changed or reverted)
             st = backends["settings"]
-            st._undo, st._left = {("profile", "demo", "demo"): "x"}, 11
-            st.changed.emit()
+            st._undo, st._deadline = {("profile", "demo", "demo"): "x"}, time.monotonic() + 11
+            st.pendingChanged.emit()
         if "--ask" in sys.argv:
             window.setProperty("askDemo", sys.argv[sys.argv.index("--ask") + 1])
         if "--notice" in sys.argv:  # code:title, show that popup message 600 ms in

@@ -2,6 +2,7 @@ import json, os, struct, tempfile, unittest
 from unittest import mock
 
 from tests.common import app  # noqa: F401
+from tests.test_runtime import wait_for
 from PySide6.QtGui import QColor, QImage
 
 from armadalive import backup, battery, closer, controls, emusettings, gamepad, media, palette, thermal
@@ -43,6 +44,7 @@ class Battery(unittest.TestCase):
         with mock.patch.object(battery.privileged, "available", return_value=True), mock.patch.object(battery.privileged, "run", return_value="the battery did not accept the limit"), \
                 mock.patch.object(battery, "CONFIG", "/tmp/armadalive-test-battery.json"):
             b.setLimit(80)
+            self.assertTrue(wait_for(lambda: b.state["refused"]))
         self.assertTrue(b.state["refused"])
         self.assertFalse(b.state["supported"])
         self.assertEqual(b.state["limit"], 100)
@@ -150,7 +152,8 @@ class Closer(unittest.TestCase):
         return c
 
     def test_releasing_early_cancels_and_nothing_to_close_does_nothing(self):
-        with mock.patch.object(closer, "terminate") as kill:
+        with mock.patch.object(closer, "terminate") as kill, \
+                mock.patch.object(closer, "process_start", return_value=42):
             c = self.make(([5], "Game"))
             c._combo(True)
             self.assertEqual(c.state["phase"], "holding")
@@ -160,7 +163,7 @@ class Closer(unittest.TestCase):
             c._combo(True)
             c._since -= 3
             c._step()
-            kill.assert_called_once_with([5])
+            kill.assert_called_once_with([5], {5: 42})
             self.assertEqual(c.state["phase"], "closed")
             idle = self.make(None)
             idle._combo(True)
