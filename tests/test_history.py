@@ -5,6 +5,7 @@ from unittest import mock
 from tests.common import app, wait_for
 from PySide6.QtCore import QEvent, QObject, QTimer, Signal
 
+from armadalive.nowplaying import LegacyIdentities
 from armadalive import backup, history
 
 
@@ -19,6 +20,7 @@ class FakeNow(QObject):
 
     def __init__(self):
         super().__init__()
+        self.identities = LegacyIdentities(self)
         self.state = dict(kind="idle", key="", playing=False)
 
     def play(self, key="snes/Chrono Trigger", title="Chrono Trigger", system="snes"):
@@ -568,7 +570,7 @@ class Sessions(unittest.TestCase):
         def write(*args, **kwargs):
             entered.set()
             release.wait(5)
-            write_json(*args, **kwargs)
+            return write_json(*args, **kwargs)
 
         with mock.patch.object(history.persistence, "write_json", side_effect=write), \
                 mock.patch.object(backup, "CONFIG_DIR", self.dir), mock.patch.object(backup, "FILE", archive):
@@ -604,7 +606,7 @@ class Sessions(unittest.TestCase):
         def write(*args, **kwargs):
             entered.set()
             release.wait(5)
-            write_json(*args, **kwargs)
+            return write_json(*args, **kwargs)
 
         with mock.patch.object(history.persistence, "write_json", side_effect=write), \
                 mock.patch.object(backup, "CONFIG_DIR", self.dir), mock.patch.object(backup, "FILE", archive), \
@@ -657,7 +659,7 @@ class Sessions(unittest.TestCase):
             self.wait_for_import(h)
         keys = dict(h.recent())
         self.assertEqual(keys["steam/1145360"]["total"], 5400)
-        self.assertEqual(keys["snes/Old Game"]["plays"], 3)
+        self.assertEqual(keys["esde:snes/Old Game.sfc"]["plays"], 3)
         self.assertNotIn("steam/999", keys)
 
 

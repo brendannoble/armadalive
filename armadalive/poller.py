@@ -15,6 +15,7 @@ class Poller(QObject):
     invalidates that generation and coalesces one follow-up read. None and raised
     exceptions preserve the last snapshot. now=False defers the initial read.
     Only presentation readers should provide idle_ms and call set_active().
+    With ms=0, the consumer schedules explicit kicks or refreshes.
     """
 
     _done = Signal(int, object, object)
@@ -36,7 +37,8 @@ class Poller(QObject):
         self._refresh_requested.connect(self.refresh, queued)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.kick)
-        self._timer.start(ms)
+        if ms > 0:
+            self._timer.start(ms)
         if now:
             self.kick()
 
@@ -66,7 +68,11 @@ class Poller(QObject):
         if self._idle_ms is None or self._active == active:
             return
         self._active = active
-        self._timer.start(self._ms if active else self._idle_ms)
+        interval = self._ms if active else self._idle_ms
+        if interval > 0:
+            self._timer.start(interval)
+        else:
+            self._timer.stop()
         if active:
             self.refresh()
 

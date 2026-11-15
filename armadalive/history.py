@@ -3,13 +3,12 @@
 It follows NowPlaying: a game that runs starts a session, anything else ends it. Steam's own play times and ES-DE's `lastplayed` are read once, so the lists are
 not empty on the first day. Kept in ~/.config/armadalive/history.json; sessions older than a year are dropped."""
 import glob, logging, os, re, threading, time
-import xml.etree.ElementTree as ET
 from concurrent.futures import Future, wait
 from copy import deepcopy
 from datetime import datetime, timedelta
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 
-from . import persistence
+from . import persistence, nowplaying as esde
 
 LOG = logging.getLogger(__name__)
 CONFIG = os.path.expanduser("~/.config/armadalive/history.json")
@@ -35,18 +34,24 @@ def _read_steam():
 
 
 def _read_esde(gamelists):
-    """[(system, file name, lastplayed epoch, playcount)] for every game ES-DE has a `lastplayed` for."""
+    """Canonical game identity and play counts from ES-DE's dated gamelist entries."""
+    root, definitions = esde._rom_configuration()
     out = []
-    for f in glob.glob(os.path.join(gamelists, "*", "gamelist.xml")):
+    for f in glob.glob(glob.escape(gamelists) + "/*/gamelist.xml"):
         system = os.path.basename(os.path.dirname(f))
-        try:
-            for g in ET.parse(f).getroot().iter("game"):
-                stamp = g.findtext("lastplayed") or ""
-                if stamp:
-                    when = datetime.strptime(stamp[:15], "%Y%m%dT%H%M%S").timestamp()
-                    out.append((system, os.path.basename(g.findtext("path") or ""), when, int(g.findtext("playcount") or 0)))
-        except (OSError, ET.ParseError, ValueError):
-            continue
+        folder = esde._system_folder(system, root, definitions.get(system))
+        entries, _ = esde._gamelist(system, folder, gamelists)
+        for relative, game in entries.items():
+            stamp = game.findtext("lastplayed") or ""
+            if not stamp:
+                continue
+            try:
+                when = datetime.strptime(stamp[:15], "%Y%m%dT%H%M%S").timestamp()
+                plays = int(game.findtext("playcount") or 0)
+            except ValueError:
+                continue
+            title = game.findtext("name") or os.path.splitext(os.path.basename(relative))[0]
+            out.append((esde.rom_key(system, relative), title, system, os.path.join(folder, relative), when, plays))
     return out
 
 
@@ -119,14 +124,21 @@ class History(QObject):
         self._np = nowplaying
         self._open = None  # [key, start epoch, seconds counted, last monotonic count]
         self._titles = {}
+        self._identities = nowplaying.identities
+        self._source = gamelists or esde.GAMELISTS
+        self._legacy_deferred = False
+        self._presentation_deferred = False
         saved = persistence.read_json(os.path.realpath(self._path), _valid_history, {})
         self._games = saved.get("games", {})
+        self._file_version = esde._stamp(self._path)
+        legacy = tuple(key for key in self._games if esde.legacy_key_parts(key))
+        self._history_proof_pending = bool(legacy)
         cutoff = time.time() - KEEP_DAYS * 86400
         self._sessions = [row for row in saved.get("sessions", []) if row[1] >= cutoff]
         self._imported = saved.get("imported", False)
         self._write_job = self._pending_save = self._failed_save = self._write_error = None
         self._waiting_baseline = None
-        self._writes_paused = self._deferred_save = False
+        self._writes_paused = self._deferred_save = self._restoring = False
         self._write_timer = QTimer(self, interval=30)
         self._write_timer.timeout.connect(self._finish_save)
         self._baseline_job = Future()
@@ -136,6 +148,8 @@ class History(QObject):
             from .nowplaying import GAMELISTS
             self._start_import(steam_titles, gamelists or GAMELISTS)
 
+        self._identities.changed.connect(self._legacy_changed)
+        self._identities.watch_history(legacy, self._source)
         nowplaying.changed.connect(self._seen)
         timer = QTimer(self)
         timer.timeout.connect(self._tick)
@@ -167,9 +181,12 @@ class History(QObject):
         if not self._imported and self._baseline_job.done() and self._baseline_job.exception() is None:
             self._seen()
             self._queue_waiting_baseline()
-        if not self._import_job.done():
+        if (not self._import_job.done() or self._history_proof_pending
+                or self._write_job is not None and not self._write_job.done()):
             return
         self._import_timer.stop()
+        if not self._writes_paused and not self._state_current():
+            return
         try:
             self._titles, steam, esde = self._import_job.result()
         except Exception as error:
@@ -188,14 +205,69 @@ class History(QObject):
                 record["total"] = record.get("total", 0) + seconds
                 record["plays"] = record.get("plays", 0) + 1
                 record["last"] = max(record.get("last", 0), last)
-            for system, name, when, plays in esde:
-                title = os.path.splitext(name)[0]
-                record = self._games.setdefault(f"{system}/{title}", dict(title=title, system=system, path="", total=0, plays=0))
+            for key, title, system, path, when, plays in esde:
+                record = self._games.setdefault(key, dict(title=title, system=system, path=path, total=0, plays=0))
                 record["last"] = max(record.get("last", 0), when)
                 record["plays"] = max(record.get("plays", 0), plays)
             self._imported = True
             self._save()
         self.changed.emit()
+
+    def _state_current(self):
+        # Delivery may lag the write itself. Do not mistake our replacement for
+        # a restore, and never adopt a later file observed by the owner thread.
+        if self._write_job is not None:
+            if not self._write_job.done():
+                return False
+            if self._write_job.exception() is None:
+                return self._write_job.result() == esde._stamp(self._path)
+        return self._file_version == esde._stamp(self._path)
+
+    def _legacy_changed(self):
+        if not self._history_proof_pending:
+            return
+        if self._writes_paused or self._write_job is not None:
+            self._legacy_deferred = True
+            return
+        aliases = self._identities.history_aliases()
+        if aliases is None:
+            return
+        self._legacy_deferred = False
+        self._history_proof_pending = False
+        self._identities.watch_history((), self._source)
+        if self._state_current() and self._migrate_legacy(aliases):
+            self._save()
+            self.changed.emit()
+
+    def _migrate_legacy(self, aliases):
+        migrated = {}
+        for legacy, (key, path) in aliases.items():
+            old = self._games.get(legacy)
+            if old is None:
+                continue
+            system, _, relative = key.removeprefix("esde:").partition("/")
+            folder = path[:-len(relative)].rstrip("/") or "/"
+            if old.get("path") and esde.rom_relative(system, old["path"], folder) != relative:
+                continue
+            current = self._games.get(key, {})
+            self._games[key] = dict(old, **current)
+            self._games[key].update(system=system, path=path,
+                                    total=old.get("total", 0) + current.get("total", 0),
+                                    plays=old.get("plays", 0) + current.get("plays", 0),
+                                    last=max(old.get("last", 0), current.get("last", 0)))
+            del self._games[legacy]
+            migrated[legacy] = key
+        if migrated:
+            for session in self._sessions:
+                session[0] = migrated.get(session[0], session[0])
+            if self._open is not None:
+                self._open[0] = migrated.get(self._open[0], self._open[0])
+        return bool(migrated)
+
+    @staticmethod
+    def _launch_record(key, record):
+        # A legacy path may only identify the last sibling that was played.
+        return dict(record, path="") if esde.legacy_key_parts(key) else record
 
     # --- accepting, writing and draining snapshots ---
     def _save(self):
@@ -240,6 +312,8 @@ class History(QObject):
         if self._write_job is None or not self._write_job.done():
             return
         error = self._write_job.exception()
+        if error is None:
+            self._file_version = self._write_job.result()
         snapshot, self._writing = self._writing, None
         self._write_job = None
         if error is not None:
@@ -256,6 +330,12 @@ class History(QObject):
                 self._write_error = OSError(str(error))
                 self._write_error.__cause__ = error
 
+        if self._write_job is None and self._legacy_deferred:
+            self._legacy_changed()
+        if self._write_job is None and self._presentation_deferred:
+            self._presentation_deferred = False
+            self._seen()
+
     def _retry_failed_save(self):
         if self._failed_save is not None:
             snapshot, self._failed_save = self._failed_save, None
@@ -268,6 +348,7 @@ class History(QObject):
         # Materialize the cutoff even if startup recovered it from a .bak file.
         self._save()
         self._writes_paused = True
+        self._restoring = restoring
 
     def writesPending(self):
         if self._waiting_baseline is not None:
@@ -281,6 +362,12 @@ class History(QObject):
 
     def resumeWrites(self):
         self._writes_paused = False
+        if self._restoring:
+            # Backup resumes a restore only after verified rollback.
+            self._file_version = esde._stamp(self._path)
+            self._restoring = False
+        if self._legacy_deferred:
+            self._legacy_changed()
         if self._deferred_save:
             self._deferred_save = False
             self._save()
@@ -314,7 +401,9 @@ class History(QObject):
                 # The already-open session can receive title and artwork after its start.
                 rec = self._games[s["key"]]
                 fields = {field: value for field, value in self._presentation(s).items() if value}
-                if any(rec.get(field) != value for field, value in fields.items()):
+                if self._write_job is not None and not self._write_job.done():
+                    self._presentation_deferred = True
+                elif self._state_current() and any(rec.get(field) != value for field, value in fields.items()):
                     rec.update(fields)
                     self._save()
                     self.changed.emit()
@@ -332,7 +421,7 @@ class History(QObject):
         fields = self._presentation(s)
         if s.get("metadataPending"):
             fields = {field: value for field, value in fields.items() if not rec.get(field)}
-        rec.update(fields, system=s.get("system", ""), path=s.get("path", ""), last=time.time())
+        rec.update(fields, system=s.get("system", ""), path=s.get("romPath") or s.get("path", ""), last=time.time())
         rec["plays"] = rec.get("plays", 0) + 1
         self._sessions.append([s["key"], int(time.time()), 0])
         self._open = [s["key"], int(time.time()), 0, time.monotonic()]
@@ -384,7 +473,7 @@ class History(QObject):
 
     def recent(self, limit=12):
         """[(key, record)], the most recently played first."""
-        items = [(k, r) for k, r in self._games.items() if r.get("last")]
+        items = [(k, self._launch_record(k, r)) for k, r in self._games.items() if r.get("last")]
         return sorted(items, key=lambda kr: kr[1]["last"], reverse=True)[:limit]
 
     def title_of(self, key):
@@ -394,6 +483,8 @@ class History(QObject):
             return t
         if key.startswith("steam/"):
             return self._titles.get("steam:" + key[6:], "")
+        if key.startswith("esde:"):
+            return os.path.splitext(os.path.basename(key))[0]
         return key.split("/", 1)[1] if "/" in key else ""
 
     def total_for(self, key):
@@ -409,13 +500,15 @@ class History(QObject):
 
     def favorites(self):
         """[(key, record)] of the games marked as favorite."""
-        return [(k, r) for k, r in self._games.items() if r.get("favorite")]
+        return [(k, self._launch_record(k, r)) for k, r in self._games.items() if r.get("favorite")]
 
     @Slot(str, str, str, str)
     def toggleFavorite(self, key, title, system, path):
         """Heart or un-heart a game; a game never played gets a record without a play time or a last-played date."""
         if not key:
             return
+        if self._np.state.get("key") == key:
+            path = self._np.state.get("romPath") or path
         rec = self._games.setdefault(key, dict(title=title or key, system=system, path=path, total=0, plays=0))
         rec["favorite"] = not rec.get("favorite")
         self._save()

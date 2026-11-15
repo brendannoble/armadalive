@@ -38,6 +38,13 @@ class TestCheats(unittest.TestCase):
         self.assertIn('cheat1_enable = "false"', entries)
         self.assertIn('cheat2_enable = "true"', entries)
 
+    def test_nested_canonical_game_keeps_the_emulator_option_filename(self):
+        c = cheats.Cheats()
+        c.toggle_cheat("esde:snes/Europe/Super.Game.sfc", 2)
+        option = self.config / "config" / "Snes9x" / "Super.Game.opt"
+        self.assertIn('cheat2_enable = "true"', option.read_text())
+        self.assertEqual(list(self.config.rglob("*.opt")), [option])
+
     def test_non_emulated_games_ignored(self):
         c = cheats.Cheats()
         c.toggle_cheat("steam/570", 0)

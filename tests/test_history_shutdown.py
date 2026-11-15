@@ -10,6 +10,7 @@ from unittest import mock
 
 from PySide6.QtCore import QObject, Signal
 
+from armadalive.nowplaying import LegacyIdentities
 from armadalive import history, persistence
 from armadalive.backup import Backup
 from tests.shutdown_process import child_app, exec_child, gate_write, run_child
@@ -18,6 +19,10 @@ from tests.shutdown_process import child_app, exec_child, gate_write, run_child
 class FakeNow(QObject):
     changed = Signal()
     state = {"kind": "idle"}
+
+    def __init__(self):
+        super().__init__()
+        self.identities = LegacyIdentities(self)
 
 
 def child(directory, mode):

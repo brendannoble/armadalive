@@ -5,6 +5,7 @@ from unittest import mock
 from tests.common import app
 from tests.test_runtime import wait_for
 from PySide6.QtCore import QObject, QTimer, Signal
+from armadalive.nowplaying import LegacyIdentities
 from armadalive import gamerules, system
 
 GAME = dict(kind="game", key="snes/Super Game (EU)", system="snes", playing=True)
@@ -15,6 +16,7 @@ class FakeNow(QObject):
 
     def __init__(self):
         super().__init__()
+        self.identities = LegacyIdentities(self)
         self.state = dict(GAME)
 
 

@@ -5,7 +5,8 @@ ones inside the AppImage, replaced by the user's `custom_systems`) and its find 
 import glob, os, re, shlex, shutil, subprocess, tempfile
 import xml.etree.ElementTree as ET
 
-from .nowplaying import ES, GAMELISTS, MEDIA, _rom_dir
+from .nowplaying import ES, GAMELISTS, MEDIA, _gamelist, _rom_dir, rom_key, rom_relative, _file_stamp, _proof_stamp
+from functools import lru_cache
 
 APPIMAGE = os.path.expanduser("~/Applications/ES-DE.AppImage")
 CACHE = os.path.expanduser("~/.cache/armadalive/esde")
@@ -49,8 +50,30 @@ def _parse(path):
 
 def systems():
     """{name: {fullname, extensions, commands: [(label, template)]}}; the user's custom_systems replace bundled ones by name."""
-    out, base = {}, _bundled()
-    for root in (_parse(base + "/es_systems.xml"), _parse(ES + "/custom_systems/es_systems.xml")):
+    return _system_definitions(ES, _bundled())
+
+def cached_systems(es):
+    """Read existing definitions without extracting an AppImage during selection."""
+    paths = (CACHE + "/es_systems.xml", es + "/custom_systems/es_systems.xml")
+    stamps = []
+    for path in paths:
+        try:
+            stamps.append(_file_stamp(path))
+        except OSError:
+            stamps.append(None)
+    return _cached_systems(es, CACHE, tuple(stamps))
+
+
+@lru_cache(maxsize=16)
+def _cached_systems(es, bundled, stamps):
+    return _system_definitions(es, bundled)
+
+
+def _system_definitions(es, bundled):
+    out = {}
+    paths = [bundled + "/es_systems.xml"] if bundled else []
+    for path in paths + [es + "/custom_systems/es_systems.xml"]:
+        root = _parse(path)
         for s in root.iter("system"):
             name = s.findtext("name")
             if name:
@@ -58,6 +81,10 @@ def systems():
                                  commands=[(c.get("label") or "", (c.text or "").strip()) for c in s.findall("command")])
     return out
 
+def system_folder(system, rom_dir, definition=None):
+    """The system's configured ROM folder, including custom paths outside the default root."""
+    path = (definition or {}).get("path") or ""
+    return os.path.expanduser(path.replace("%ROMPATH%", rom_dir.rstrip("/"))) or os.path.join(rom_dir, system)
 
 def _rules():
     out = {}
@@ -91,7 +118,8 @@ def command(system, rom, defs=None, rules=None, label=""):
     s = defs.get(system)
     if not s or not s["commands"]:
         return None
-    label = label or _alternative(system, rom)
+    folder = os.path.abspath(system_folder(system, _rom_dir(), s))
+    label = label or _alternative(system, rom, folder)
     template = next((t for lab, t in s["commands"] if lab == label), s["commands"][0][1])
     base, parent = os.path.basename(rom), os.path.dirname(rom)
     subs = {"%ROM%": rom, "%ROMRAW%": rom, "%FILENAME%": base, "%BASENAME%": os.path.splitext(base)[0], "%GAMEDIR%": parent,
@@ -116,31 +144,84 @@ def command(system, rom, defs=None, rules=None, label=""):
     return None if any("%" in w and re.search(r"%[A-Z_0-9-]+%", w) for w in words) else words
 
 
-def _alternative(system, rom):
+def _alternative(system, rom, folder):
     """The emulator ES-DE was told to use: for this game in its gamelist, else for the whole system."""
     root = _parse(f"{GAMELISTS}/{system}/gamelist.xml")
-    for g in root.iter("game"):
-        if os.path.basename(g.findtext("path") or "") == os.path.basename(rom) and g.findtext("altemulator"):
-            return g.findtext("altemulator")
+    relative = rom_relative(system, rom, folder)
+    if relative:
+        for game in root.iter("game"):
+            if rom_relative(system, game.findtext("path") or "", folder) == relative and game.findtext("altemulator"):
+                return game.findtext("altemulator")
     return root.findtext("alternativeEmulator/label") or ""
 
-
 def _cover_index(system):
-    """Match the previous cover type and filename preference with one listing per directory."""
+    """Index each media directory once, preserving type and filename preference."""
     covers = {}
     for kind in COVERS:
-        directory = os.path.join(MEDIA, system, kind)
-        try:
-            names = sorted(os.listdir(directory))
-        except OSError:
-            continue
-        for filename in names:
-            # A basename followed by any suffix matched the original glob.
-            path = os.path.join(directory, filename)
-            for index, char in enumerate(filename):
-                if char == ".":
-                    covers.setdefault(filename[:index], path)
+        base = os.path.join(MEDIA, system, kind)
+
+        def visit(relative=""):
+            directory = os.path.join(base, relative) if relative else base
+            try:
+                names = sorted(os.listdir(directory))
+            except OSError:
+                return
+            for filename in names:
+                path = os.path.join(directory, filename)
+                key = os.path.join(relative, filename)
+                if os.path.isdir(path):
+                    if not os.path.islink(path):
+                        visit(key)
+                    continue
+                for index, char in enumerate(filename):
+                    if char == ".":
+                        covers.setdefault(os.path.join(relative, filename[:index]), path)
+        visit()
     return covers
+
+
+def _proof_directories(folder, versions):
+    """Visit every logical subtree, or refuse proof when aliases prevent exhaustion."""
+    pending, seen = [folder], set()
+    while pending:
+        here = pending.pop()
+        stamp = _file_stamp(here)
+        if stamp[:2] in seen:
+            raise OSError("repeated directory target prevents unique legacy attribution")
+        seen.add(stamp[:2])
+        if versions is not None:
+            versions[here] = stamp
+        files = []
+        with os.scandir(here) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    target = _proof_stamp(entry.path)
+                    if versions is not None:
+                        versions[entry.path] = target
+                if entry.is_dir(follow_symlinks=True):
+                    pending.append(entry.path)
+                elif entry.is_file(follow_symlinks=True):
+                    files.append(entry.name)
+        yield here, files
+
+
+def rom_files(folder, extensions, *, onerror=None, stems=None, versions=None, proof=False):
+    """Enumerate catalog files, or exhaustively inspect candidates for legacy proof."""
+    if proof:
+        directories = _proof_directories(folder, versions)
+    else:
+        def visible():
+            for here, dirs, files in os.walk(folder, onerror=onerror):
+                dirs[:] = [d for d in dirs if not d.startswith(".")
+                           and d not in ("media", "images", "videos", "manuals")]
+                yield here, files
+        directories = visible()
+    for here, files in directories:
+        for filename in files:
+            stem, extension = os.path.splitext(filename)
+            if ((proof or not filename.startswith(".")) and (extensions is None or extension.lower() in extensions)
+                    and (stems is None or stem in stems)):
+                yield os.path.relpath(os.path.join(here, filename), folder)
 
 
 def games(definitions=None):
@@ -149,25 +230,21 @@ def games(definitions=None):
     definitions = systems() if definitions is None else definitions
     for name, s in definitions.items():
         # the folder ES-DE itself uses: its <path> (with %ROMPATH% and ~ expanded), else <ROM directory>/<system>
-        folder = os.path.expanduser((s.get("path") or "").replace("%ROMPATH%", root.rstrip("/"))) or os.path.join(root, name)
+        folder = os.path.abspath(system_folder(name, root, s))
         if not os.path.isdir(folder):
             continue
-        titles, hidden = {}, set()
-        for g in _parse(f"{GAMELISTS}/{name}/gamelist.xml").iter("game"):
-            key = os.path.basename(g.findtext("path") or "")
-            titles[key] = g.findtext("name") or ""
-            if (g.findtext("hidden") or "").lower() == "true":
-                hidden.add(key)
+        entries, _ = _gamelist(name, folder, GAMELISTS)
         found = []
         covers = _cover_index(name)
-        for here, dirs, files in os.walk(folder):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("media", "images", "videos", "manuals")]
-            for f in files:
-                if f.startswith(".") or os.path.splitext(f)[1].lower() not in s["extensions"] or f in hidden:
-                    continue
-                path = os.path.join(here, f)
-                found.append(dict(id=f"esde:{name}/{os.path.relpath(path, folder)}", name=titles.get(f) or os.path.splitext(f)[0],
-                                  cover=covers.get(os.path.splitext(f)[0], ""), rom=path))
+        for relative in rom_files(folder, s["extensions"]):
+            entry = entries.get(relative)
+            if entry is not None and (entry.findtext("hidden") or "").lower() == "true":
+                continue
+            stem = os.path.splitext(os.path.basename(relative))[0]
+            title = entry.findtext("name") if entry is not None else ""
+            path = os.path.join(folder, relative)
+            found.append(dict(id=rom_key(name, relative), name=title or stem,
+                              cover=covers.get(os.path.splitext(relative)[0]) or covers.get(stem, ""), rom=path))
         if found:
             out[name] = sorted(found, key=lambda g: g["name"].lower())
     return out
