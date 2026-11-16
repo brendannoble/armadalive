@@ -475,5 +475,187 @@ class LogCache(unittest.TestCase):
                 os.unlink(path)
                 self.assertEqual(ss._read_log(cached), ('', 0, 0))
 
+
+
+
+class RuleReadiness(unittest.TestCase):
+    make = Add.make
+    GAME = Add.GAME
+
+    def start(self, c, current=lambda: True):
+        c.launch('Fixture', 'gc', '/roms/gc/Fixture.iso', lambda *_: ['/usr/bin/emu', 'fixture'], current)
+        wait_for(lambda: c._preparing is None)
+
+    def test_pending_rule_does_not_send_a_launch(self):
+        c = self.make(self.GAME)
+        c._prepare_esde_launch = lambda *_: None
+        sent = []
+        with mock.patch.object(ss, 'known_appid', return_value=123), \
+                mock.patch.object(ss, 'eval_js', side_effect=lambda *args, **kw: sent.append(args)):
+            self.start(c)
+        self.assertEqual(sent, [])
+        self.assertTrue(c.state['busy'])
+
+    def test_failed_rule_blocks_launch(self):
+        c = self.make(self.GAME)
+        c._prepare_esde_launch = lambda *_: 'Cannot recover emulator settings'
+        sent = []
+        with mock.patch.object(ss, 'known_appid', return_value=123), \
+                mock.patch.object(ss, 'eval_js', side_effect=lambda *args, **kw: sent.append(args)):
+            self.start(c)
+        self.assertEqual(sent, [])
+        self.assertEqual(c.notices, ['launchBlocked'])
+
+    def test_pending_proof_resumes_once_and_keeps_admission(self):
+        c = self.make(self.GAME)
+        result, sent = [None], []
+        c._prepare_esde_launch = lambda *_: result[0]
+        with mock.patch.object(ss, 'known_appid', return_value=123), \
+                mock.patch.object(ss, 'eval_js', side_effect=lambda script, done, **kw: sent.append((script, done, kw['valid']))):
+            self.start(c)
+            c.launch_steam('12', 'Other', lambda: True)
+            self.assertEqual(sent, [])
+            result[0] = ''
+            c.resume_esde_launch()
+            c.resume_esde_launch()
+            self.assertEqual(len(sent), 1)
+            self.assertTrue(sent[0][2]())
+            sent[0][1](True)
+        self.assertEqual(c.notices, ['launchRequested'])
+        self.assertFalse(c.state['busy'])
+
+    def test_pending_proof_expiry_cannot_renew_deadline_without_timer_delivery(self):
+        c = self.make(self.GAME)
+        result, clock, sent = [None], [10.0], []
+        c._prepare_esde_launch = lambda *_: result[0]
+        with mock.patch.object(ss, 'time', SimpleNamespace(monotonic=lambda: clock[0])), \
+                mock.patch.object(ss, 'known_appid', return_value=123), \
+                mock.patch.object(ss, 'eval_js', side_effect=lambda *a, **kw: sent.append(a)):
+            self.start(c)
+            clock[0] = 14.0
+            c.resume_esde_launch()
+            self.assertEqual(c._waiting_rule.deadline, 15.0)
+            result[0] = ''
+            clock[0] = 15.0
+            c.resume_esde_launch()
+        self.assertEqual(sent, [])
+        self.assertEqual(c.notices, ['prepareFailed'])
+
+    def test_obsolete_pending_proof_does_not_dispatch_or_notify(self):
+        c = self.make(self.GAME)
+        current, sent = [True], []
+        c._prepare_esde_launch = lambda *_: None
+        with mock.patch.object(ss, 'known_appid', return_value=123), \
+                mock.patch.object(ss, 'eval_js', side_effect=lambda *a, **kw: sent.append(a)):
+            self.start(c, lambda: current[0])
+            current[0] = False
+            c.resume_esde_launch()
+        self.assertEqual(sent, [])
+        self.assertEqual(c.notices, [])
+        self.assertFalse(c.state['busy'])
+
+    def test_readiness_is_rechecked_after_discovery_and_cannot_extend_deadline(self):
+        from tests.test_steamui_target import Socket
+        c = self.make(self.GAME)
+        socket, discovered, result = Socket(), [], ['']
+        c._prepare_esde_launch = lambda *_: result[0]
+        with mock.patch.object(ss, 'known_appid', return_value=123), \
+                mock.patch.object(steamui, 'QWebSocket', return_value=socket), \
+                mock.patch.object(steamui, '_discover', side_effect=lambda shared, done: discovered.append(done)):
+            self.start(c)
+            self.assertEqual(len(discovered), 1)
+            result[0] = 'Game rules are paused during backup'
+            discovered[0]('ws://fixture')
+            socket.connected.emit()
+        self.assertEqual(socket.sent, [])
+        self.assertEqual(c.notices, ['launchBlocked'])
+
+    def test_proof_becoming_pending_during_discovery_waits_then_dispatches(self):
+        c = self.make(self.GAME)
+        result, sent = [''], []
+        c._prepare_esde_launch = lambda *_: result[0]
+        with mock.patch.object(ss, 'known_appid', return_value=123), \
+                mock.patch.object(ss, 'eval_js', side_effect=lambda script, done, **kw: sent.append((done, kw['valid']))):
+            self.start(c)
+            result[0] = None
+            self.assertFalse(sent[0][1]())
+            sent[0][0](None)
+            self.assertTrue(c.state['busy'])
+            result[0] = ''
+            c.resume_esde_launch()
+            self.assertEqual(len(sent), 2)
+            sent[1][0](True)
+        self.assertEqual(c.notices, ['launchRequested'])
+
+    def test_sent_creation_confirmation_is_cached_after_selection_becomes_obsolete(self):
+        c = self.make(self.GAME)
+        c._prepare_esde_launch = lambda *_: ''
+        current, sent = [True], []
+        with mock.patch.object(ss, 'known_appid', return_value=None), \
+                mock.patch.object(ss, 'artwork', return_value=[]), \
+                mock.patch.object(ss, 'eval_js', side_effect=lambda script, done, **kw: sent.append(done)):
+            self.start(c, lambda: current[0])
+            current[0] = False
+            sent[0](123)
+        self.assertEqual(c._recent[1], 123)
+        self.assertFalse(c.state['busy'])
+        self.assertEqual(c.notices, [])
+
+    def test_rule_error_is_a_blocked_launch_and_native_launch_bypasses_rules(self):
+        c = self.make(self.GAME)
+        c._prepare_esde_launch = mock.Mock(side_effect=OSError('unavailable'))
+        sent = []
+        with mock.patch.object(ss, 'known_appid', return_value=123), \
+                mock.patch.object(ss, 'eval_js', side_effect=lambda script, done, **kw: sent.append(done)):
+            self.start(c)
+            self.assertEqual(sent, [])
+            self.assertEqual(c.notices, ['launchBlocked'])
+            c.launch_steam('12', 'Native', lambda: True)
+            self.assertEqual(len(sent), 1)
+            sent[0](True)
+        self.assertEqual(c.notices, ['launchBlocked', 'launchRequested'])
+
+
+    def test_real_rules_allow_noop_dispatch_while_another_game_is_running(self):
+        from pathlib import Path
+        from armadalive import gamerules, emusettings, nowplaying
+        from tests.test_gamerules import FakeNow, FakeGs, FakeSys
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config, actual = root / 'game_rules.json', root / 'GFX.ini'
+        config.write_text('{"rules": {}}')
+        original = '[Settings]\nInternalResolution=2\n'
+        actual.write_text(original)
+        self.enterContext(mock.patch.object(gamerules, 'CONFIG', config))
+        self.enterContext(mock.patch.dict(emusettings.SPECS, {'gc': (actual, 'Settings', 'InternalResolution', '{}')}))
+        self.enterContext(mock.patch.object(nowplaying, '_rom_configuration', return_value=(str(root), {})))
+        now, gs, system = FakeNow(), FakeGs(), FakeSys()
+        for obj in (now, gs, system):
+            self.addCleanup(delete_qobject, obj)
+        now.state = dict(kind='game', key='esde:gc/Other.iso', system='gc', playing=True)
+        now.running = True
+        rules = gamerules.GameRules(now, gs, system)
+        self.addCleanup(delete_qobject, rules)
+        c = ss.SteamShortcuts(prepare_esde_launch=rules.prepare_esde_launch)
+        self.addCleanup(close_shortcuts, c)
+        notices, sent = [], []
+        c.notice.connect(lambda code, detail: notices.append(code))
+        def dispatch(script, done, **kwargs):
+            if kwargs['valid']():
+                sent.append(script)
+                done(True)
+            else:
+                done(None)
+        with mock.patch.object(ss, 'known_appid', return_value=123), \
+                mock.patch.object(ss, 'eval_js', side_effect=dispatch):
+            for enabled in (True, False):
+                rules.setEnabled(enabled)
+                c.launch('Fixture', 'gc', str(root / 'gc/Fixture.iso'),
+                         lambda *_: ['/usr/bin/emu', 'fixture'], lambda: True)
+                wait_for(lambda: not c.state['busy'])
+        self.assertEqual(notices, ['launchRequested', 'launchRequested'])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(actual.read_text(), original)
+
+
 if __name__ == "__main__":
     unittest.main()

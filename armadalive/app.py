@@ -75,10 +75,13 @@ def main():
     emulator_ctrl = EmulatorControl()
     history = History(now, steam_titles=lambda: {g["id"]: g["name"] for g in steamlib.games(art=False)})
     now.history = history
-    shortcuts = SteamShortcuts(now)
+    rules = GameRules(now, gamescope, monitor)
+    shortcuts = SteamShortcuts(now, prepare_esde_launch=rules.prepare_esde_launch)
+    now.changed.connect(shortcuts.resume_esde_launch)
+    now.identities.changed.connect(shortcuts.resume_esde_launch)
+    rules.changed.connect(shortcuts.resume_esde_launch)
     app_catalog = Apps(history, shortcuts)
     ui, tiles, battery = UiSettings(), Tiles(), Battery()
-    rules = GameRules(now, gamescope, monitor)
     backup = Backup((app_catalog, history, ui, tiles, battery, rules))
     app.aboutToQuit.connect(backup.flushWriters)
     backends = dict(steamui=steamui, gamescope=gamescope, nowPlaying=now, system=monitor, ayn=AynButton(), settings=Settings(), apps=app_catalog, history=history, gameinfo=GameInfo(history), shell=Shell(), controls=Controls(), ui=ui, updater=Updater(), admin=Admin(),

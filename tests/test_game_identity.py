@@ -22,6 +22,7 @@ class CurrentGame(QObject):
         super().__init__()
         self.state = dict(kind="idle", key="", playing=False)
         self.identities = n.LegacyIdentities(self)
+        self.processes_known = True
 
     def select(self, path, *, playing=False):
         self.state, _ = n._esde_selection(dict(event="game-start" if playing else "game-select",
